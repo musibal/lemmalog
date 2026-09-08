@@ -1,4 +1,5 @@
 //! lemmalog-mcp: the Lemmalog engine as an MCP server (stdio JSON-RPC),
+//! Optional HTTP mode shares one in-memory store across N agents, instead of N copies that overwrite each other.
 //! for agent CLIs like Claude Code and Kimi CLI.
 //!
 //! Build:  cargo build --release --features mcp
@@ -20,19 +21,20 @@ use lemmalog::canonical;
 use lemmalog::eval::Engine;
 use lemmalog::intern::Value;
 use serde_json::{json, Value as J};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 struct State {
     memory: AgentMemory<lemmalog::agent::MockExtractor>,
+    path: Option<String>,
 }
 
 fn main() {
     let path = std::env::var("LEMMALOG_MCP_PATH").ok();
-    let mut memory = AgentMemory::new(
-        lemmalog::agent::MockExtractor::new(0.9),
-        "",
-    )
-    .expect("fresh memory");
+    let mut memory =
+        AgentMemory::new(lemmalog::agent::MockExtractor::new(0.9), "").expect("fresh memory");
     if let Some(p) = &path {
         if std::path::Path::new(p).exists() {
             match AgentMemory::load(lemmalog::agent::MockExtractor::new(0.9), p) {
@@ -41,7 +43,24 @@ fn main() {
             }
         }
     }
-    let mut state = State { memory };
+    let state = State { memory, path };
+    if let Ok(addr) = std::env::var("LEMMALOG_MCP_HTTP") {
+        let listener = TcpListener::bind(&addr).expect("bind LEMMALOG_MCP_HTTP");
+        eprintln!("lemmalog-mcp: HTTP listening on {addr}");
+        let state = Arc::new(Mutex::new(state));
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let state = Arc::clone(&state);
+                    thread::spawn(move || handle_connection(stream, state));
+                }
+                Err(e) => eprintln!("lemmalog-mcp: HTTP accept failed: {e}"),
+            }
+        }
+        return;
+    }
+
+    let mut state = state;
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -49,43 +68,159 @@ fn main() {
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(msg) = serde_json::from_str::<J>(&line) else { continue };
-        let method = msg["method"].as_str().unwrap_or_default().to_string();
-        let id = msg.get("id").cloned();
-        if id.is_none() {
-            continue; // notification (e.g. initialized): no response
+        let Ok(msg) = serde_json::from_str::<J>(&line) else {
+            continue;
+        };
+        if let Some(resp) = handle(&mut state, &msg) {
+            writeln!(out, "{resp}").ok();
+            out.flush().ok();
         }
-        let result = match method.as_str() {
-            "initialize" => Ok(json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "lemmalog", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": SERVER_INSTRUCTIONS
-            })),
-            "tools/list" => Ok(json!({"tools": tools()})),
-            "tools/call" => {
-                let name = msg["params"]["name"].as_str().unwrap_or_default();
-                let args = &msg["params"]["arguments"];
-                tool_call(&mut state, name, args, path.as_deref())
-            }
-            other => Err(format!("unknown method {other:?}")),
-        };
-        let resp = match result {
-            Ok(v) => json!({"jsonrpc": "2.0", "id": id.unwrap(), "result": v}),
-            Err(e) => json!({
-                "jsonrpc": "2.0", "id": id.unwrap(),
-                "error": {"code": -32000, "message": e}
-            }),
-        };
-        writeln!(out, "{resp}").ok();
-        out.flush().ok();
     }
+}
+
+/// Shared HTTP transport: one in-memory store serves multiple agents instead
+/// of separate stores that overwrite each other's snapshots.
+fn handle(state: &mut State, msg: &J) -> Option<J> {
+    let id = msg.get("id").cloned();
+    if id.is_none() {
+        return None; // notification (e.g. initialized): no response
+    }
+    let method = msg["method"].as_str().unwrap_or_default().to_string();
+    let result = match method.as_str() {
+        "initialize" => Ok(json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "lemmalog", "version": env!("CARGO_PKG_VERSION")},
+            "instructions": SERVER_INSTRUCTIONS
+        })),
+        "tools/list" => Ok(json!({"tools": tools()})),
+        "tools/call" => {
+            let name = msg["params"]["name"].as_str().unwrap_or_default();
+            let args = &msg["params"]["arguments"];
+            let path = state.path.clone();
+            tool_call(state, name, args, path.as_deref())
+        }
+        other => Err(format!("unknown method {other:?}")),
+    };
+    let id = id.unwrap();
+    Some(match result {
+        Ok(v) => json!({"jsonrpc": "2.0", "id": id, "result": v}),
+        Err(e) => json!({
+            "jsonrpc": "2.0", "id": id,
+            "error": {"code": -32000, "message": e}
+        }),
+    })
+}
+
+fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<State>>) {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let request = match read_request(&mut stream, &mut buffer, &mut chunk) {
+            Ok(request) => request,
+            Err(e) => {
+                eprintln!("lemmalog-mcp: HTTP request failed: {e}");
+                return;
+            }
+        };
+        let Some((headers_end, content_length, method)) = request else {
+            return;
+        };
+        let body_end = headers_end + content_length;
+        let body = buffer[headers_end..body_end].to_vec();
+        buffer.drain(..body_end);
+
+        if method != "POST" {
+            if write_http_response(&mut stream, "405 Method Not Allowed", &[]).is_err() {
+                return;
+            }
+            continue;
+        }
+        let response = match serde_json::from_slice::<J>(&body) {
+            Ok(msg) => {
+                let mut state = state.lock().expect("state lock poisoned");
+                handle(&mut state, &msg)
+            }
+            Err(_) => Some(json!({
+                "jsonrpc": "2.0", "id": null,
+                "error": {"code": -32700, "message": "Parse error"}
+            })),
+        };
+        match response {
+            Some(response) => {
+                let body = response.to_string();
+                if write_http_response(&mut stream, "200 OK", body.as_bytes()).is_err() {
+                    return;
+                }
+            }
+            None => {
+                if write_http_response(&mut stream, "202 Accepted", &[]).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn read_request(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+    chunk: &mut [u8],
+) -> std::io::Result<Option<(usize, usize, String)>> {
+    let headers_end = loop {
+        if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let n = stream.read(chunk)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        buffer.extend_from_slice(&chunk[..n]);
+    };
+    let headers = std::str::from_utf8(&buffer[..headers_end]).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid HTTP headers")
+    })?;
+    let mut lines = headers.lines();
+    let method = lines
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_default()
+        .to_string();
+    let content_length = lines
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.trim().parse::<usize>())
+        .transpose()
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid Content-Length")
+        })?
+        .unwrap_or(0);
+    while buffer.len() < headers_end + content_length {
+        let n = stream.read(chunk)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated HTTP body",
+            ));
+        }
+        buffer.extend_from_slice(&chunk[..n]);
+    }
+    Ok(Some((headers_end, content_length, method)))
+}
+
+fn write_http_response(stream: &mut TcpStream, status: &str, body: &[u8]) -> std::io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(body)
 }
 
 fn tools() -> J {
     json!([
         tool("lemmalog_observe",
-            "Assert facts into memory (host model does extraction). Input: facts in the line protocol 'S --rel[conf]--> O', one per line; optional ts integer (default: engine clock). Example: 'Alice --works_at--> Acme\\nBob --manager--> Carol'.", &["facts", "ts"], &["facts"]),
+            "Assert facts into memory (host model does extraction). Input: facts in the line protocol 'S --rel[conf]--> O', one per line; optional ts integer (default: wall clock, never the logical clock). Example: 'Alice --works_at--> Acme\\nBob --manager--> Carol'.", &["facts", "ts"], &["facts"]),
         tool("lemmalog_retract",
             "Retract facts that turned out to be WRONG (line protocol, same as observe). Open matching rows are removed and invalidation propagates: the response reports which derived facts died as a consequence. For a value that merely CHANGED, prefer re-asserting the same relation (the update policy supersedes).", &["facts"], &["facts"]),
         tool("lemmalog_query",
@@ -99,6 +234,10 @@ fn tools() -> J {
         tool("lemmalog_uninstall",
             "Uninstall a rule batch by id (see lemmalog_batches). Derivations revert.", &["id"], &["id"]),
         tool("lemmalog_batches", "List installed rule batches.", &[], &[]),
+        tool("lemmalog_escalations",
+            "List queued escalation conflicts in order. Read-only.", &[], &[]),
+        tool("lemmalog_resolve_escalation",
+            "Dismiss a queued escalation by its zero-based index.", &["index"], &["index"]),
         tool("lemmalog_what_if",
             "Hypothetical: 'what would follow if these facts were true?' Input: facts (line protocol) + goal atom. Store is untouched.", &["facts", "goal"], &["facts", "goal"]),
         tool("lemmalog_canonicalize",
@@ -122,7 +261,9 @@ WRONG call lemmalog_retract (the response lists which conclusions \
 died). Asserted facts are queried as current(Subject, \"rel\", Object) \
 — querying rel(X, Y) directly returns nothing. For a changed value, \
 re-assert the same relation (old one supersedes). lemmalog_changes \
-with your last epoch resyncs you after context resets.";
+with your last epoch resyncs you after context resets. Use \
+lemmalog_escalations to inspect queued conflicts and \
+lemmalog_resolve_escalation to dismiss one by index.";
 
 /// Property descriptions shared by the per-tool schemas (each tool
 /// advertises only the properties it actually takes — a model that sees
@@ -139,6 +280,7 @@ fn prop_desc(p: &str) -> &'static str {
         "query" => "natural-language query",
         "budget_tokens" => "context token budget",
         "since" => "epoch checkpoint",
+        "index" => "zero-based escalation index",
         _ => "",
     }
 }
@@ -149,7 +291,7 @@ fn tool(name: &str, desc: &str, props: &[&str], required: &[&str]) -> J {
         .map(|p| {
             (
                 p.to_string(),
-                json!({"type": if *p == "ts" || *p == "budget_tokens" || *p == "since" { "integer" } else { "string" }, "description": prop_desc(p)}),
+                json!({"type": if *p == "ts" || *p == "budget_tokens" || *p == "since" || *p == "index" { "integer" } else { "string" }, "description": prop_desc(p)}),
             )
         })
         .collect();
@@ -261,13 +403,8 @@ fn tool_call(
             let facts = args["facts"].as_str().unwrap_or_default();
             let ts = args["ts"].as_i64();
             let mem = &mut state.memory;
-            let (report, dropped) = match ts {
-                Some(t) => mem.observe_extracted(facts, t),
-                None => {
-                    let now = mem.engine.now;
-                    mem.observe_extracted(facts, now)
-                }
-            };
+            let t = mem.ts_or_wall_clock(ts);
+            let (report, dropped) = mem.observe_extracted(facts, t);
             let now = mem.engine.now;
             mem.maintain(now);
             let mut out = format!(
@@ -451,6 +588,33 @@ fn tool_call(
             .map(|(id, src)| format!("{id}: {src}"))
             .collect::<Vec<_>>()
             .join("\n")),
+        "lemmalog_escalations" => {
+            let escalations = state.memory.escalations();
+            if escalations.is_empty() {
+                Ok("(empty)".to_string())
+            } else {
+                Ok(escalations
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, text)| format!("{idx}: {text}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+        }
+        "lemmalog_resolve_escalation" => {
+            let raw_index = args["index"].as_i64().ok_or_else(|| {
+                "input: `index` is required and must be an integer".to_string()
+            })?;
+            let queue_len = state.memory.escalations().len();
+            if raw_index < 0 || raw_index as usize >= queue_len {
+                Err(format!(
+                    "index {raw_index} out of range; current queue length {queue_len}"
+                ))
+            } else {
+                state.memory.resolve_escalation(raw_index as usize);
+                Ok(format!("resolved escalation {raw_index}"))
+            }
+        }
         "lemmalog_what_if" => {
             let facts = args["facts"].as_str().unwrap_or_default();
             let goal = args["goal"].as_str().unwrap_or_default().to_string();
@@ -584,6 +748,7 @@ fn tool_call(
                 "lemmalog_uninstall", "lemmalog_batches", "lemmalog_what_if",
                 "lemmalog_canonicalize", "lemmalog_context", "lemmalog_dump",
                 "lemmalog_changes", "lemmalog_save", "lemmalog_run",
+                "lemmalog_escalations", "lemmalog_resolve_escalation",
             ]
             .to_vec();
             let stripped = other.trim_start_matches("lemmalog_");
@@ -617,11 +782,28 @@ fn tool_call(
     if !is_error
         && matches!(
             name,
-            "lemmalog_observe" | "lemmalog_install_rules" | "lemmalog_uninstall" | "lemmalog_canonicalize"
+            // `lemmalog_retract` MUST be here: retraction closes a validity
+            // interval in RAM, so leaving it out means a fact the agent
+            // deliberately marked FALSE comes back alive on the next restart
+            // (verified: retract -> gone from RAM -> still in file -> restart
+            // -> `S=hecho_falso, O=mentira` again). Absence is state here.
+            "lemmalog_observe"
+                | "lemmalog_retract"
+                | "lemmalog_install_rules"
+                | "lemmalog_uninstall"
+                | "lemmalog_canonicalize"
+                | "lemmalog_resolve_escalation"
         )
     {
+        // A discarded save error reports success to the agent while the disk
+        // silently drops the write; memory loss must never be quiet.
         if let Some(p) = path {
-            let _ = state.memory.save(p);
+            if let Err(e) = state.memory.save(p) {
+                return Ok(json!({
+                    "content": [{"type": "text", "text": format!("{text}\n\nWARNING: snapshot NOT saved ({e}) — this change lives only in RAM")}],
+                    "isError": true
+                }));
+            }
         }
     }
     Ok(json!({
@@ -655,7 +837,7 @@ mod tests {
     fn every_tool_schema_lists_only_its_own_properties() {
         let ts = tools();
         let list = ts.as_array().unwrap();
-        assert_eq!(list.len(), 15);
+        assert_eq!(list.len(), 17);
         for t in list {
             let props: Vec<&str> = t["inputSchema"]["properties"]
                 .as_object()

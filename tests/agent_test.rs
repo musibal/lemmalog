@@ -517,3 +517,65 @@ fn quoted_objects_parse_to_clean_symbols() {
     let bad = "hyp_1 --hypothesis--> \"unclosed claim about things";
     assert!(lemmalog::agent::parse_protocol_strict(bad, 0.9).is_empty());
 }
+
+
+#[test]
+fn ts_less_observe_lands_on_wall_clock_not_logical_clock() {
+    // Regression: the logical clock starts at 0, so a ts-less observe used
+    // to land with validity [0, infinity). 1921 edges were damaged this way
+    // before it was caught (2026-09-08).
+    let mut m = mem("");
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let t = m.ts_or_wall_clock(None);
+    assert!(t >= wall, "ts-less default {t} is behind the wall clock {wall}");
+    // an explicit ts still wins, and the clock never runs backwards
+    assert_eq!(m.ts_or_wall_clock(Some(42)), 42);
+    m.observe_extracted("alice --works_at--> acme", t);
+    assert!(m.ts_or_wall_clock(None) >= t);
+}
+
+
+#[test]
+fn snapshot_omits_aggregate_scratch_relations() {
+    // `__agg:{head}:{clause_index}` rows are derived scratch: `save` must not
+    // write them (they were 80% of a real store's FACT lines) and `load` must
+    // re-derive the aggregate from base facts alone.
+    let dir = std::env::temp_dir().join("lemmalog-test-agg-scratch");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("mem.snapshot");
+    let path = path.to_str().unwrap();
+
+    let mut m = mem("");
+    m.observe_at(
+        "hyp_1 --evidence--> src/a.rs:1\n\
+         hyp_1 --evidence--> src/b.rs:2\n\
+         hyp_2 --evidence--> src/c.rs:3",
+        100,
+    );
+    m.install_rules("evidence_count(H, count(E)) :- current(H, \"evidence\", E).")
+        .unwrap();
+    m.maintain(100);
+    let before = m.ask("evidence_count(\"hyp_1\", N)").unwrap();
+    assert_eq!(before, vec!["N=2".to_string()]);
+
+    m.save(path).unwrap();
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(
+        !text.contains("FACT\t__agg:"),
+        "aggregate scratch leaked into the snapshot"
+    );
+
+    let mut m2 = AgentMemory::load(MockExtractor::new(0.9), path).unwrap();
+    assert_eq!(
+        m2.ask("evidence_count(\"hyp_1\", N)").unwrap(),
+        before,
+        "load must re-derive the aggregate that save omitted"
+    );
+    assert_eq!(
+        m2.ask("evidence_count(\"hyp_2\", N)").unwrap(),
+        vec!["N=1".to_string()]
+    );
+}

@@ -103,9 +103,11 @@ fn entity_token_problem(s: &str) -> Option<String> {
         Some(format!(
             "'{s}' is a pronoun or role word — resolve it to the entity's real name"
         ))
-    } else if s.len() > 60 || s.split_whitespace().count() > 8 {
-        Some("looks like prose (more than 8 words) — entity names are short".to_string())
-    } else if !s.chars().any(|c| c.is_whitespace()) && s.len() <= 60 {
+    } else if s.split_whitespace().count() > 8
+        || (s.chars().any(|c| c.is_whitespace()) && s.len() > 60)
+    {
+        Some("looks like prose (more than 8 words, or a long spaced phrase) — entity names are short".to_string())
+    } else if !s.chars().any(|c| c.is_whitespace()) {
         // a single token accepts all printable characters: kernel-code
         // facts need `*pmap`, `entry->next`, `MAP_FIXED|MAP_ANON`,
         // `vm_fault_entry()` — and since the line protocol already
@@ -536,6 +538,26 @@ impl<X: Extractor> AgentMemory<X> {
     /// `current("alice", R, O)` against materialized relations.
     pub fn ask(&self, goal: &str) -> Result<Vec<String>, crate::ast::ParseError> {
         self.engine.ask(goal)
+    }
+
+    /// Timestamp to ingest with when the caller did not supply one.
+    ///
+    /// The logical clock (`engine.now`) is the WRONG default: it starts at 0
+    /// on a fresh store and otherwise freezes at whatever `ts` the last
+    /// caller happened to pass, so a `ts`-less observe lands with validity
+    /// `[0, infinity)` or silently backdated. One store accumulated 1921
+    /// such edges before this was found (2026-09-08). Wall clock is the
+    /// honest default; `max` keeps the clock monotonic if the system time
+    /// ever moves backwards relative to the store.
+    pub fn ts_or_wall_clock(&self, ts: Option<i64>) -> i64 {
+        match ts {
+            Some(t) => t,
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(self.engine.now)
+                .max(self.engine.now),
+        }
     }
 
     /// Ingest PRE-PARSED facts (callers that extract themselves, e.g. the
@@ -1073,6 +1095,20 @@ impl<X: Extractor> AgentMemory<X> {
         for (pred, rel) in &self.engine.relations {
             // base facts only: skip predicates defined by rules (they are
             // either program facts re-declared from rules, or derived)
+            //
+            // `__agg:{head}:{clause_index}` temp relations are derived too, but
+            // their defining clause is synthesised on the fly by
+            // `lower_agg_clause` and never lands in `self.clauses`, so the
+            // `head.pred` test below never matched them and every aggregate's
+            // scratch rows were persisted -- against the invariant stated
+            // above. Worse, the name carries the ABSOLUTE clause index, which
+            // `uninstall` shifts: each uninstall orphaned a whole generation of
+            // rows under a name no live clause claims, so nothing ever cleared
+            // them. One store had 20275 such rows, 80% of its FACT lines.
+            // `load()` re-derives them, so skipping is lossless.
+            if pred.starts_with("__agg:") {
+                continue;
+            }
             if self.engine.clauses.iter().any(|c| c.head.pred == *pred) {
                 continue;
             }

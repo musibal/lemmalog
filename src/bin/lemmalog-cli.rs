@@ -48,12 +48,25 @@ fn flag(args: &[String], name: &str) -> Option<String> {
     })
 }
 
+/// Payload for a MUTATING command. Empty is always a mistake — `rules` with no
+/// flag and no piped stdin used to install an EMPTY batch and then save, which
+/// clobbers a snapshot (and, on a snapshot owned by another harness, silently
+/// wipes work). Guarded here, where observe/retract/rules all route through,
+/// instead of three times in the callers.
 fn stdin_or_flag(args: &[String], name: &str) -> String {
     if let Some(v) = flag(args, name) {
+        if v.trim().is_empty() {
+            eprintln!("lemmalog-cli: {name} is empty — refusing to write");
+            std::process::exit(2);
+        }
         return v;
     }
     let mut buf = String::new();
     let _ = std::io::stdin().read_to_string(&mut buf);
+    if buf.trim().is_empty() {
+        eprintln!("lemmalog-cli: no {name} and nothing on stdin — refusing to write (this is not a read command; use query/context/why/batches/dump)");
+        std::process::exit(2);
+    }
     buf
 }
 
@@ -65,7 +78,7 @@ fn main() {
             let mut m = load(&snap_path());
             let text = stdin_or_flag(&args, "--facts");
             let ts = flag(&args, "--ts").and_then(|t| t.parse::<i64>().ok());
-            let ts = ts.unwrap_or(m.engine.now);
+            let ts = m.ts_or_wall_clock(ts);
             let (report, dropped) = m.observe_extracted(&text, ts);
             let _ = m.maintain(m.engine.now);
             m.save(&snap_path()).expect("save snapshot");

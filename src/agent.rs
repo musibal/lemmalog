@@ -472,7 +472,14 @@ impl<X: Extractor> AgentMemory<X> {
             "current_value",
         ];
         let pred_name = self.engine.interner.display(&pred).to_string();
-        let multi = MULTI.iter().any(|m| pred_name.starts_with(m));
+        // `multi("rel")` is the declarable counterpart of `exclusive("rel")`.
+        // Without it the ONLY way to be multi-valued was the English whitelist
+        // above, so every legitimately multi-valued relation named in another
+        // language (causa, capacidad, condicion, regla...) queued a false
+        // conflict on its second value: 39 of them in the live store, which is
+        // how an error channel turns into wallpaper nobody reads.
+        let multi = MULTI.iter().any(|m| pred_name.starts_with(m))
+            || !self.engine.query("multi", &[Some(pred)]).is_empty();
         let functional = FUNCTIONAL.iter().any(|f| pred_name.starts_with(f));
         let exclusive = functional
             || !self.engine.query("exclusive", &[Some(pred)]).is_empty();

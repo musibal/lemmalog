@@ -55,6 +55,20 @@ fn exclusive_pred_supersedes_deterministically() {
 }
 
 #[test]
+fn declared_multi_accumulates_without_escalating() {
+    // counterpart of exclusive(): a relation declared multi-valued takes a
+    // second value silently, whatever language it is named in.
+    let mut m = mem("multi(\"causa\").");
+    m.maintain(1); // declaraciones del programa se materializan al evaluar
+    m.observe("fallo --causa--> disco_lleno");
+    let r = m.observe("fallo --causa--> reloj_desfasado");
+    assert_eq!(r.added, 1);
+    assert!(r.escalations.is_empty(), "declared multi must not escalate: {:?}", r.escalations);
+    m.maintain(100);
+    assert_eq!(m.ask("current(\"fallo\", \"causa\", O)").unwrap().len(), 2);
+}
+
+#[test]
 fn non_exclusive_conflict_escalates() {
     let mut m = mem("");
     m.observe("alice --likes--> bob");

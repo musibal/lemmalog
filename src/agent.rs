@@ -444,46 +444,32 @@ impl<X: Extractor> AgentMemory<X> {
             report.added += 1;
             return;
         }
-        if open.iter().any(|k| k[2] == obj) {
-            // same fact re-observed: merge annotation, no structural change
-            let mut k = open[0].clone();
-            k[2] = obj;
-            self.engine.declare(
-                "edge",
-                &k,
-                Ann::base(c.confidence, [ep.id.clone()]),
-            );
+        if let Some(k) = open.iter().find(|k| k[2] == obj).cloned() {
+            // same fact re-observed: merge annotation, no structural change...
+            self.engine.declare("edge", &k, Ann::base(c.confidence, [ep.id.clone()]));
+            // ...except when the relation is exclusive and OTHER values are
+            // still open. Declaring exclusive() is not retroactive: it only
+            // supersedes at assert time, so a slot that already held three
+            // "current" deploy versions stayed wrong forever, and re-asserting
+            // the right one landed here as a NOOP. Re-stating the truth is the
+            // natural repair gesture, so let it close the stale siblings.
+            if self.is_exclusive(&pred) && open.len() > 1 {
+                let stale: Vec<Vec<Value>> =
+                    open.iter().filter(|o| o[2] != obj).cloned().collect();
+                for old in stale {
+                    let mut closed = old.clone();
+                    closed[4] = Value::Int(self.engine.now);
+                    self.engine.retract("edge", &old);
+                    self.engine.declare("edge", &closed, Ann::base(0.9, ["superseded"]));
+                    report.updated += 1;
+                }
+                return;
+            }
             report.noop += 1;
             return;
         }
-        // relation semantics by name: naturally multi-valued relations
-        // accumulate silently (escalating on every `evidence` add taught
-        // agents to fight the store); naturally functional ones
-        // supersede without needing an explicit `exclusive()` declare
-        // (without this, status(H, supported) left status(H, proposed)
-        // open too — both "true" at once)
-        const MULTI: [&str; 15] = [
-            "evidence", "mentions", "located", "describes", "tag",
-            "related_to", "depends_on", "owns", "calls", "part_of",
-            "source", "cites", "symptom_of", "aka", "alias_of",
-        ];
-        const FUNCTIONAL: [&str; 7] = [
-            "status", "phone", "address", "email", "version", "value_of",
-            "current_value",
-        ];
-        let pred_name = self.engine.interner.display(&pred).to_string();
-        // `multi("rel")` is the declarable counterpart of `exclusive("rel")`.
-        // Without it the ONLY way to be multi-valued was the English whitelist
-        // above, so every legitimately multi-valued relation named in another
-        // language (causa, capacidad, condicion, regla...) queued a false
-        // conflict on its second value: 39 of them in the live store, which is
-        // how an error channel turns into wallpaper nobody reads.
-        let multi = MULTI.iter().any(|m| pred_name.starts_with(m))
-            || !self.engine.query("multi", &[Some(pred)]).is_empty();
-        let functional = FUNCTIONAL.iter().any(|f| pred_name.starts_with(f));
-        let exclusive = functional
-            || !self.engine.query("exclusive", &[Some(pred)]).is_empty();
-        if exclusive && !multi {
+        let multi = self.is_multi(&pred);
+        if self.is_exclusive(&pred) {
             for old in &open {
                 let mut closed = old.clone();
                 closed[4] = Value::Int(self.engine.now);
@@ -507,6 +493,37 @@ impl<X: Extractor> AgentMemory<X> {
             ));
             report.added += 1;
         }
+    }
+
+    /// Relation semantics by name. Naturally multi-valued relations accumulate
+    /// silently (escalating on every `evidence` add taught agents to fight the
+    /// store); naturally functional ones supersede without needing an explicit
+    /// declare (without this, status(H, supported) left status(H, proposed)
+    /// open too — both "true" at once). Both sides are also declarable:
+    /// `exclusive("rel").` and `multi("rel").`, which is what a store whose
+    /// relations are not named in English needs.
+    fn is_multi(&self, pred: &Value) -> bool {
+        const MULTI: [&str; 15] = [
+            "evidence", "mentions", "located", "describes", "tag",
+            "related_to", "depends_on", "owns", "calls", "part_of",
+            "source", "cites", "symptom_of", "aka", "alias_of",
+        ];
+        let name = self.engine.interner.display(pred).to_string();
+        MULTI.iter().any(|m| name.starts_with(m))
+            || !self.engine.query("multi", &[Some(*pred)]).is_empty()
+    }
+
+    /// At most one open value per (S,P).
+    fn is_exclusive(&self, pred: &Value) -> bool {
+        const FUNCTIONAL: [&str; 7] = [
+            "status", "phone", "address", "email", "version", "value_of",
+            "current_value",
+        ];
+        let name = self.engine.interner.display(pred).to_string();
+        let functional = FUNCTIONAL.iter().any(|f| name.starts_with(f));
+        let exclusive =
+            functional || !self.engine.query("exclusive", &[Some(*pred)]).is_empty();
+        exclusive && !self.is_multi(pred)
     }
 
     fn assert_open(&mut self, spo: &[Value; 3], conf: f64, prov: &str) {

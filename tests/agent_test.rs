@@ -593,3 +593,26 @@ fn snapshot_omits_aggregate_scratch_relations() {
         vec!["N=1".to_string()]
     );
 }
+
+#[test]
+fn reasserting_the_survivor_closes_stale_siblings_of_an_exclusive_slot() {
+    // exclusive() is not retroactive: a slot that already held several open
+    // values keeps them. Re-stating the true one is the natural repair gesture
+    // and used to land in the NOOP branch, leaving the store wrong forever.
+    let mut m = mem("");
+    m.observe_at("worker --sabor--> a", 100);
+    let r = m.observe_at("worker --sabor--> b", 110);
+    assert_eq!(r.escalations.len(), 1, "sin exclusive todavia: conflicto en cola");
+    m.install_rules("exclusive(\"sabor\").").unwrap();
+    m.maintain(150);
+    assert_eq!(m.ask("current(\"worker\", \"sabor\", O)").unwrap().len(), 2, "el doble sigue abierto");
+    let r = m.observe_at("worker --sabor--> a", 200);
+    assert_eq!(r.updated, 1, "re-afirmar la buena cierra la obsoleta");
+    assert!(r.escalations.is_empty());
+    m.maintain(200);
+    assert_eq!(
+        m.ask("current(\"worker\", \"sabor\", O)").unwrap(),
+        vec!["O=a".to_string()],
+        "queda una sola verdad"
+    );
+}

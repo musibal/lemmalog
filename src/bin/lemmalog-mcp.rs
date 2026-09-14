@@ -562,7 +562,11 @@ fn tool_call(
             match engine_of(state).install_program(rules) {
                 Ok(id) => {
                     let n = engine_of(state).run();
-                    Ok(format!("installed {id}; backfill derived +{n} facts"))
+                    // a multi()/exclusive() declaration answers the queued
+                    // warnings about that relation; close them here (the
+                    // queue is a cache, the declaration is the fix)
+                    let purged = state.memory.purge_declared_escalations();
+                    Ok(format!("installed {id}; backfill derived +{n} facts; queue purged {purged}"))
                 }
                 Err(e) => Err(format!(
                     "rules rejected — nothing installed:\n{e}\ncommon causes: recursion through negation; aggregates outside rule heads; parse errors (rules end with '.')"

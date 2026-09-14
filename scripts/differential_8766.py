@@ -6,8 +6,18 @@ write target is the snapshot COPY under /tmp. Divergence = test.
 
   usage: differential_8766.py [--candidate BIN] [--prod 8765] [--port 8766] [--keep]
 """
-import argparse, json, os, shutil, socket, subprocess, sys, tempfile, time
+import argparse, json, os, re, shutil, socket, subprocess, sys, tempfile, time
 from urllib import request, error
+
+# Heads whose goals are also asked with a bound constant (plan-fork Fase 1
+# item 1): a real row, then the same row with ONE constant mutated.
+BOUND_HEADS = [
+    ("multi", 1),
+    ("exclusive", 1),
+    ("current", 3),
+    ("uso_relacion", 1),
+    ("evidence_count", 2),
+]
 
 PROBES = [
     # full derived state + raw base facts: identical data must derive identically
@@ -49,6 +59,67 @@ def call(port, tool, args):
     text = "\n".join(b.get("text", "") for b in blocks)
     return sorted(text.splitlines())
 
+NO_ANSWER = "(no answers"
+
+def answered(lines):
+    """Rows of a query result. A miss is not "zero lines": the server answers
+    a miss with an explanatory line, and a ground goal that HOLDS used to
+    answer with an empty body — which is exactly the false negative this
+    probe pins down."""
+    return [l for l in lines if l.strip() and not l.startswith(NO_ANSWER)]
+
+def bound_literal(v):
+    """Constant as the goal parser must read it back: bare when the store
+    displays a number (the line protocol stores digit-only objects as Int),
+    quoted otherwise (the tool schema tells models to quote constants)."""
+    return v if re.fullmatch(r"-?\d+", v) else '"%s"' % v
+
+def bound_literals(v):
+    """Every spelling of a constant that must find the row: the displayed one,
+    plus the quoted form of a number (how a model copies a value out of a
+    result — the same fact used to answer "no such fact")."""
+    return [v, '"%s"' % v] if re.fullmatch(r"-?\d+", v) else ['"%s"' % v]
+
+def probe_bound_goals(port, heads):
+    """Ground goals: for each head take the first real row of the free query
+    and check that (a) the ground goal built from its values answers with at
+    least one row, and (b) the same row with ONE constant mutated (`_zz`
+    suffix) answers with none. Read-only. Returns (fails, detail lines)."""
+    fails, lines = 0, []
+    for pred, arity in heads:
+        vars_ = ["X", "Y", "Z"][:arity]
+        free = call(port, "lemmalog_query", {"goal": f"{pred}({', '.join(vars_)})"})
+        rows = answered(free)
+        row = None
+        for r in rows:
+            vals = [p.split("=", 1)[1] for p in r.split(", ") if "=" in p]
+            if len(vals) == arity:
+                row = vals
+                break
+        if row is None:
+            lines.append(f"    {pred:<15} SKIP (no parsable free row: {len(rows)} rows)")
+            continue
+        bad = []
+        for i in range(arity):
+            for lit in bound_literals(row[i]):
+                pat = [vars_[j] if j != i else lit for j in range(arity)]
+                goal = f"{pred}({', '.join(pat)})"
+                ground = answered(call(port, "lemmalog_query", {"goal": goal}))
+                if not ground:
+                    bad.append(f"ground {goal} -> NO ROW (the row exists)")
+            mutated = list(row)
+            mutated[i] = mutated[i] + "_zz"
+            pat = [vars_[j] if j != i else bound_literal(mutated[i]) for j in range(arity)]
+            goal = f"{pred}({', '.join(pat)})"
+            hit = answered(call(port, "lemmalog_query", {"goal": goal}))
+            if hit:
+                bad.append(f"mutated {goal} -> {len(hit)} ROW(S), expected 0")
+        fails += len(bad)
+        lines.append(f"    {pred:<15} row={row} {'ok' if not bad else 'FAIL'}")
+        for b in bad:
+            lines.append(f"        {b}")
+    return fails, lines
+
 def wait_ready(port, proc, deadline=20.0):
     end = time.time() + deadline
     while time.time() < end:
@@ -56,7 +127,10 @@ def wait_ready(port, proc, deadline=20.0):
             return False
         try:
             rpc(port, "initialize", timeout=2)
-            return True
+            # The port can answer because a STALE server of a previous run
+            # still holds it (the new one dies on AddrInUse). Only a live
+            # candidate makes the verdict about this binary.
+            return proc.poll() is None
         except Exception:
             time.sleep(0.2)
     return False
@@ -128,6 +202,23 @@ def main():
                 for row in rows[:5]:
                     print(f"      {tag}: {row[:160]}")
             rc = 1
+        # Bound constants, checked per port (this is NOT a prod-vs-candidate
+        # diff): the candidate must answer a ground goal that holds with at
+        # least one row and must not answer a mutated constant at all. A
+        # pre-fix binary fails the ground half by design, so production is
+        # reported for information until it is redeployed.
+        cfails, clines = probe_bound_goals(a.port, BOUND_HEADS)
+        print(f"  bound-goals(cand {a.port}): {'FAIL ' + str(cfails) + ' check(s)' if cfails else 'ok'}")
+        for l in clines:
+            print(l)
+        if cfails:
+            rc = 1
+        try:
+            pfails, _ = probe_bound_goals(a.prod, BOUND_HEADS)
+            note = "ok" if not pfails else f"{pfails} check(s) — expected on a pre-fix binary"
+            print(f"  bound-goals(prod {a.prod}): {note}")
+        except Exception as e:
+            print(f"  bound-goals(prod {a.prod}): SKIP {e}")
         if a.write_probe:
             rel, subj = "rel_sonda_diferencial", "sonda_diferencial"
             before = len(call(a.port, "lemmalog_escalations", {}))
@@ -148,6 +239,9 @@ def main():
             print(f"  write-probe:{rel:<10} escalations {before} -> {after}  delta={delta}  {verdict}")
             if delta != 1:
                 rc = 1
+        if proc.poll() is not None:
+            print(f"FAIL candidate exited mid-run (code {proc.poll()})")
+            rc = 1
         print("DIVERGED" if diverged else "NO DIVERGENCE")
     finally:
         proc.terminate()

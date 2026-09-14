@@ -274,6 +274,129 @@ fn engine_agrees_with_naive_oracle_on_random_programs() {
     assert_eq!(mismatches, 0, "{mismatches}/300 random programs disagree with the oracle");
 }
 
+/// Bound constants, not just free queries: `ask` with a constant pinned in
+/// one or both positions must answer exactly what filtering the oracle's
+/// fact set answers. The free-query differential above cannot see this class
+/// — a goal with a bound constant answered "no such fact" for facts the same
+/// engine listed when asked free (measured on the live store 2026-09-15:
+/// `multi("provee")`, 94 rows free, answered nothing; and a quoted number
+/// missed the `Int` the bare number found, on 413 `current` rows).
+///
+/// The numeric facts below are the second half of that class: the protocol
+/// stores digit-looking objects as `Int` (agent.rs), the oracle sees the
+/// string they display as, and the goal must find them in BOTH spellings.
+#[test]
+fn bound_goals_agree_with_naive_oracle() {
+    const NUMS: [&str; 2] = ["3", "17"];
+    let mut checks = 0usize;
+    let mut mismatches = 0usize;
+    for seed in 1..=200u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x2545F4914F6CDD1D) | 1);
+        let (rules, facts) = gen_program(&mut rng);
+        // oracle input: the numeric objects as the strings they render as
+        let mut oracle_facts = facts.clone();
+        for (i, n) in NUMS.iter().enumerate() {
+            oracle_facts.push((
+                EDB[i % EDB.len()].to_string(),
+                CONSTS[i % CONSTS.len()].to_string(),
+                n.to_string(),
+            ));
+        }
+        let want = naive_fixpoint(&rules, &oracle_facts);
+
+        let mut e = Engine::new();
+        e.install_program(&rules).unwrap();
+        for (p, s, o) in &facts {
+            let (sv, ov) = (e.sym(s), e.sym(o));
+            e.declare(p, &[sv, ov], Ann::unit());
+        }
+        for (i, n) in NUMS.iter().enumerate() {
+            // exactly what the line protocol does with a digit-only object
+            let s = e.sym(CONSTS[i % CONSTS.len()]);
+            e.declare(
+                EDB[i % EDB.len()],
+                &[s, Value::Int(n.parse().unwrap())],
+                Ann::unit(),
+            );
+        }
+        e.run();
+        // free query: display strings must match the oracle's fact set
+        let mut got = BTreeSet::new();
+        for p in IDB {
+            for (k, _) in e.query(p, &[]) {
+                got.insert((
+                    p.to_string(),
+                    e.interner.display(&k[0]).to_string(),
+                    e.interner.display(&k[1]).to_string(),
+                ));
+            }
+        }
+        if got != want {
+            eprintln!(
+                "seed {seed} free-query mismatch\nrules:\n{rules}\nfacts: {oracle_facts:?}\noracle-only: {:?}\nengine-only: {:?}",
+                want.difference(&got).collect::<Vec<_>>(),
+                got.difference(&want).collect::<Vec<_>>()
+            );
+            mismatches += 1;
+        }
+        // bound goals: a constant in the first position, the second, both,
+        // and a constant no fact mentions (the zero control)
+        for p in IDB {
+            let oracle: Vec<(String, String)> = want
+                .iter()
+                .filter(|(q, _, _)| q == p)
+                .map(|(_, a, b)| (a.clone(), b.clone()))
+                .collect();
+            let mut forms: Vec<Option<(String, bool)>> =
+                CONSTS.iter().map(|c| Some((c.to_string(), true))).collect();
+            for n in NUMS {
+                // a number can be written bare or quoted: both must find it
+                forms.push(Some((n.to_string(), false)));
+                forms.push(Some((n.to_string(), true)));
+            }
+            forms.push(None);
+            forms.push(Some(("zz".to_string(), true))); // in no fact at all
+            for c1 in &forms {
+                for c2 in &forms {
+                    let arg = |c: &Option<(String, bool)>, v: &str| match c {
+                        Some((c, quote)) => {
+                            if *quote {
+                                format!("\"{c}\"")
+                            } else {
+                                c.to_string()
+                            }
+                        }
+                        None => v.to_string(),
+                    };
+                    let lit = |c: &Option<(String, bool)>| c.as_ref().map(|(c, _)| c.clone());
+                    let goal = format!("{p}({}, {})", arg(c1, "X"), arg(c2, "Y"));
+                    let got = e.ask(&goal).unwrap().len();
+                    let expected = oracle
+                        .iter()
+                        .filter(|(a, b)| {
+                            lit(c1).map(|c| &c == a).unwrap_or(true)
+                                && lit(c2).map(|c| &c == b).unwrap_or(true)
+                        })
+                        .count();
+                    checks += 1;
+                    if got != expected {
+                        mismatches += 1;
+                        if mismatches <= 5 {
+                            eprintln!(
+                                "seed {seed}: `{goal}` engine={got} oracle={expected}\nrules:\n{rules}\nfacts: {oracle_facts:?}\nrows: {oracle:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        mismatches, 0,
+        "{mismatches}/{checks} bound-goal checks disagree with the oracle"
+    );
+}
+
 #[test]
 fn incremental_agrees_with_from_scratch() {
     // same programs, but feed EDB facts one batch at a time with interleaved

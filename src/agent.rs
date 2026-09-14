@@ -855,23 +855,41 @@ impl<X: Extractor> AgentMemory<X> {
         for c in &candidates {
             let subj = self.engine.sym(&c.subj);
             let pred = self.engine.sym(&c.pred);
-            let obj = match c.obj.parse::<i64>() {
-                Ok(n) => Value::Int(n),
-                Err(_) => self.engine.sym(&c.obj),
+            let is_alias = matches!(c.pred.as_str(), "alias" | "alias_of");
+            let obj = if is_alias {
+                self.engine.sym(&c.obj)
+            } else {
+                match c.obj.parse::<i64>() {
+                    Ok(n) => Value::Int(n),
+                    Err(_) => self.engine.sym(&c.obj),
+                }
             };
-            let open: Vec<Vec<Value>> = self
-                .engine
-                .query("edge", &[Some(subj), Some(pred), Some(obj), None, None, None])
-                .into_iter()
-                .map(|(k, _)| k)
-                .filter(|k| matches!(k[4].as_int(), Some(vt) if vt == i64::MAX))
-                .collect();
+            let (base_pred, open): (&str, Vec<Vec<Value>>) = if is_alias {
+                (
+                    "alias",
+                    self.engine
+                        .query("alias", &[Some(subj), Some(obj)])
+                        .into_iter()
+                        .map(|(k, _)| k)
+                        .collect(),
+                )
+            } else {
+                (
+                    "edge",
+                    self.engine
+                        .query("edge", &[Some(subj), Some(pred), Some(obj), None, None, None])
+                        .into_iter()
+                        .map(|(k, _)| k)
+                        .filter(|k| matches!(k[4].as_int(), Some(vt) if vt == i64::MAX))
+                        .collect(),
+                )
+            };
             if open.is_empty() {
                 missing.push(format!("{} --{}--> {}", c.subj, c.pred, c.obj));
                 continue;
             }
             for row in &open {
-                self.engine.retract("edge", row);
+                self.engine.retract(base_pred, row);
             }
             done.push(format!("{} --{}--> {}", c.subj, c.pred, c.obj));
         }

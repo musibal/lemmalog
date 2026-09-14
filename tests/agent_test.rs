@@ -69,6 +69,25 @@ fn declared_multi_accumulates_without_escalating() {
 }
 
 #[test]
+fn explicit_policy_overrides_builtin_relation_lists() {
+    let mut m = mem("exclusive(\"located\").");
+    m.maintain(1);
+    m.observe_at("doc --located--> first", 100);
+    let report = m.observe_at("doc --located--> second", 200);
+    assert!(report.escalations.is_empty(), "{report:?}");
+    m.maintain(200);
+    assert_eq!(m.ask("current(\"doc\", \"located\", O)").unwrap(), vec!["O=second".to_string()]);
+
+    let mut m = mem("multi(\"status\").");
+    m.maintain(1);
+    m.observe_at("hyp --status--> proposed", 100);
+    let report = m.observe_at("hyp --status--> supported", 200);
+    assert!(report.escalations.is_empty(), "{report:?}");
+    m.maintain(200);
+    assert_eq!(m.ask("current(\"hyp\", \"status\", O)").unwrap().len(), 2);
+}
+
+#[test]
 fn non_exclusive_conflict_escalates() {
     let mut m = mem("");
     m.observe("alice --likes--> bob");
@@ -478,6 +497,21 @@ fn retract_facts_accepts_alias_and_reports_dead_canonical_views() {
     assert!(loaded.engine.query("alias", &[None, None]).is_empty());
     assert!(loaded.ask("current_canon(\"canonical\", \"color\", \"blue\")").unwrap().is_empty());
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn canonical_views_refresh_incrementally_for_new_current_facts() {
+    let mut m = mem("");
+    m.observe_extracted("seed --kind--> value", 100);
+    m.maintain(100);
+    install_canonicalization(&mut m.engine, &["current"]).unwrap();
+    assert_alias(&mut m.engine, "local", "canonical", 0.9);
+    m.engine.run();
+
+    m.observe_extracted("local --zz_rel--> cosa_uno", 200);
+    m.maintain(200);
+    assert_eq!(m.ask("current(\"local\", \"zz_rel\", X)").unwrap(), vec!["X=cosa_uno".to_string()]);
+    assert_eq!(m.ask("current_canon(\"canonical\", \"zz_rel\", X)").unwrap(), vec!["X=cosa_uno".to_string()]);
 }
 
 #[test]

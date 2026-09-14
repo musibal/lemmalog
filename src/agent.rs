@@ -522,8 +522,12 @@ impl<X: Extractor> AgentMemory<X> {
             "source", "cites", "symptom_of", "aka", "alias_of",
         ];
         let name = self.engine.interner.display(pred).to_string();
+        let declared_multi = !self.engine.query("multi", &[Some(*pred)]).is_empty();
+        let declared_exclusive = !self.engine.query("exclusive", &[Some(*pred)]).is_empty();
+        if declared_multi || declared_exclusive {
+            return declared_multi;
+        }
         MULTI.iter().any(|m| name.starts_with(m))
-            || !self.engine.query("multi", &[Some(*pred)]).is_empty()
     }
 
     /// At most one open value per (S,P).
@@ -549,6 +553,13 @@ impl<X: Extractor> AgentMemory<X> {
             Value::Int(self.engine.now),
         ];
         self.engine.declare("edge", &args, Ann::base(conf, [prov]));
+        // Canonical views need a domain fact before their reflexive maps_to
+        // fallback can project newly observed symbols incrementally.
+        if self.engine.clauses.iter().any(|c| c.head.pred == "maps_to") {
+            for value in spo {
+                self.engine.declare("entity", &[*value], Ann::unit());
+            }
+        }
     }
 
     /// Advance time and run incremental maintenance (the sleep-time slot).

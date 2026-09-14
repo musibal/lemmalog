@@ -330,6 +330,12 @@ pub struct AgentMemory<X: Extractor> {
     extractor: X,
     episodes: Vec<Episode>,
     escalations: Vec<String>,
+    /// `(subject, pred)` slot of each entry in `escalations`, parallel to it;
+    /// `None` for lines written before the queue was keyed by slot. The queue
+    /// holds at most one live warning per slot: a third value on the same
+    /// conflicted slot REPLACES its warning in place (one line per added value
+    /// made the queue grow with the square of the values in a slot).
+    escalation_slots: Vec<Option<(String, String)>>,
     episode_counter: u64,
     /// Epoch of the last completed `maintain()`; `context()` reports
     /// memory changes since then.
@@ -357,6 +363,7 @@ impl<X: Extractor> AgentMemory<X> {
             extractor,
             episodes: Vec::new(),
             escalations: Vec::new(),
+            escalation_slots: Vec::new(),
             episode_counter: 0,
             last_turn_epoch: 0,
             extra_rules: extra_rules.to_string(),
@@ -387,7 +394,6 @@ impl<X: Extractor> AgentMemory<X> {
             self.apply_update(c, &episode, &mut report);
         }
         self.episodes.push(episode);
-        self.escalations.extend(report.escalations.clone());
         report
     }
 
@@ -410,7 +416,6 @@ impl<X: Extractor> AgentMemory<X> {
             self.apply_update(c, &episode, &mut report);
         }
         self.episodes.push(episode);
-        self.escalations.extend(report.escalations.clone());
         report
     }
 
@@ -487,10 +492,18 @@ impl<X: Extractor> AgentMemory<X> {
                 .iter()
                 .map(|k| self.engine.interner.display(&k[2]))
                 .collect();
-            report.escalations.push(format!(
-                "conflict: {} --{}--> {} asserted in {}, but {} also open ({})",
-                c.subj, c.pred, c.obj, ep.id, c.pred, others.join(", ")
-            ));
+            let msg = format!(
+                "conflict: {} --{}--> {} asserted in {}, but {} also open ({}){}",
+                c.subj,
+                c.pred,
+                c.obj,
+                ep.id,
+                c.pred,
+                others.join(", "),
+                Self::escalation_remedy(&c.pred)
+            );
+            report.escalations.push(msg.clone());
+            self.enqueue_escalation(msg, Some((c.subj.clone(), c.pred.clone())));
             report.added += 1;
         }
     }
@@ -555,7 +568,84 @@ impl<X: Extractor> AgentMemory<X> {
     pub fn resolve_escalation(&mut self, idx: usize) {
         if idx < self.escalations.len() {
             self.escalations.remove(idx);
+            self.escalation_slots.remove(idx);
         }
+    }
+
+    /// Copy-paste remedy on every conflict warning: `multi()` keeps both
+    /// values, `exclusive()` needs a re-assertion (declarations are not
+    /// retroactive). Naming the fix in the line is what keeps the queue from
+    /// being a dead end for the agent reading it.
+    fn escalation_remedy(pred: &str) -> String {
+        format!(
+            " fix: multi(\"{}\"). keeps both (old values stay open, on purpose); \
+             exclusive(\"{}\"). then RE-ASSERT the survivor — declaring it \
+             does not close the values already open",
+            pred, pred
+        )
+    }
+
+    /// Slot of an escalation line: `conflict: {subj} --{pred}--> ...`. Only
+    /// `load()` reads keys back out of the text; the live path builds them
+    /// from the candidate's names at the push site.
+    fn escalation_slot(line: &str) -> Option<(String, String)> {
+        let rest = line.strip_prefix("conflict: ")?;
+        let (subj, rest) = rest.split_once(" --")?;
+        let (pred, _) = rest.split_once("--> ")?;
+        Some((subj.to_string(), pred.to_string()))
+    }
+
+    /// Queue one warning keyed by slot: replaces that slot's previous warning
+    /// in place — the index of every other slot stays valid, and the message
+    /// only ever grows (it lists the slot's open values).
+    fn enqueue_escalation(&mut self, msg: String, slot: Option<(String, String)>) {
+        if let Some(ref key) = slot {
+            if let Some(i) = self
+                .escalation_slots
+                .iter()
+                .position(|s| s.as_ref() == Some(key))
+            {
+                self.escalations[i] = msg;
+                self.escalation_slots[i] = slot;
+                return;
+            }
+        }
+        self.escalations.push(msg);
+        self.escalation_slots.push(slot);
+    }
+
+    /// Drop warnings whose relation is now declared `multi()`/`exclusive()`:
+    /// the declaration IS the answer, so the line is stale by construction.
+    /// Without this, declaring the relation leaves every warning it was meant
+    /// to silence in the queue (19 of the 38 live lines, measured 2026-09-15).
+    pub fn purge_declared_escalations(&mut self) -> usize {
+        let slots = self.escalation_slots.clone();
+        let mut declared: Vec<bool> = Vec::with_capacity(slots.len());
+        for s in &slots {
+            match s {
+                // `lookup`, never `sym`: interning here gives the name a
+                // fresh id before the facts are loaded, and derived row order
+                // follows symbol ids (measured: it reorders context assembly).
+                // A name no fact mentions is not ours to purge.
+                Some((_, pred)) => match self.engine.interner.lookup(pred) {
+                    Some(sym) => {
+                        let v = Value::Sym(sym);
+                        declared.push(self.is_multi(&v) || self.is_exclusive(&v));
+                    }
+                    None => declared.push(false),
+                },
+                None => declared.push(false),
+            }
+        }
+        let mut dropped = 0usize;
+        for i in (0..declared.len()).rev() {
+            if declared[i] {
+                self.escalations.remove(i);
+                self.escalation_slots.remove(i);
+                dropped += 1;
+            }
+        }
+        dropped
     }
 
     /// Agent-facing read-only query: bindings for an atom like
@@ -607,13 +697,22 @@ impl<X: Extractor> AgentMemory<X> {
             self.apply_update(c, &episode, &mut report);
         }
         self.episodes.push(episode);
-        self.escalations.extend(report.escalations.clone());
         (report, dropped)
     }
 
     /// Agent tool surface: install a rule batch (versioned, revertable).
     pub fn install_rules(&mut self, src: &str) -> Result<String, Box<dyn std::error::Error>> {
-        self.engine.install_program(src)
+        let id = self.engine.install_program(src)?;
+        // `multi("r").` / `exclusive("r").` answer every queued warning about
+        // `r`; drop them here instead of making the agent dismiss them by hand.
+        // A declaration is a program fact: it only reaches the engine on a
+        // run(), and paying for that only when the queue is non-empty leaves
+        // the (overwhelmingly common) no-warning path untouched.
+        if !self.escalations.is_empty() {
+            let _ = self.engine.run();
+            self.purge_declared_escalations();
+        }
+        Ok(id)
     }
 
     /// Agent tool surface: uninstall a rule batch; derivations revert on
@@ -1249,7 +1348,40 @@ impl<X: Extractor> AgentMemory<X> {
             m.extra_rules = rules;
             m
         };
-        m.escalations = escalations;
+        // Fold the persisted queue by slot: a snapshot written before the
+        // queue was keyed by slot holds one line per added value. Keep the
+        // LAST line per slot — it lists every open value the earlier ones did.
+        let mut folded: Vec<String> = Vec::new();
+        for line in escalations {
+            match Self::escalation_slot(&line) {
+                Some(key) => {
+                    // lines written before the remedy existed: give the
+                    // surviving one the copyable fix so no legacy warning
+                    // is a dead end either
+                    let line = if line.contains("fix: multi(") {
+                        line
+                    } else {
+                        format!("{line}{}", Self::escalation_remedy(&key.1))
+                    };
+                    match m
+                        .escalation_slots
+                        .iter()
+                        .position(|s| s.as_ref() == Some(&key))
+                    {
+                        Some(i) => folded[i] = line,
+                        None => {
+                            m.escalation_slots.push(Some(key));
+                            folded.push(line);
+                        }
+                    }
+                }
+                None => {
+                    m.escalation_slots.push(None);
+                    folded.push(line);
+                }
+            }
+        }
+        m.escalations = folded;
         m.episodes = episodes;
         m.episode_counter = m.episodes.len() as u64;
         for (pred, conf, prov, args) in facts {
@@ -1264,6 +1396,9 @@ impl<X: Extractor> AgentMemory<X> {
         }
         m.engine.set_now(now);
         let _ = m.engine.run();
+        // Only now: every queued slot's relation has an id, so this interns
+        // nothing (see `purge_declared_escalations`).
+        m.purge_declared_escalations();
         m.last_turn_epoch = m.engine.epoch();
         Ok(m)
     }

@@ -616,3 +616,76 @@ fn reasserting_the_survivor_closes_stale_siblings_of_an_exclusive_slot() {
         "queda una sola verdad"
     );
 }
+
+#[test]
+fn one_conflict_warning_per_slot_replaced_in_place_and_dropped_by_the_declaration() {
+    let mut m = mem("");
+    m.observe_at("worker --sabor--> a", 100);
+    assert!(m.escalations().is_empty(), "sin doble no hay aviso");
+    let r = m.observe_at("worker --sabor--> b", 110);
+    assert_eq!(r.escalations.len(), 1);
+    assert_eq!(m.escalations().len(), 1);
+    // tercer valor del MISMO slot: el aviso se reemplaza, no se acumula
+    m.observe_at("worker --sabor--> c", 120);
+    assert_eq!(
+        m.escalations().len(),
+        1,
+        "un slot, un aviso: {:?}",
+        m.escalations()
+    );
+    // el aviso trae el remedio copiable
+    assert!(m.escalations()[0].contains("multi(\"sabor\")"));
+    assert!(m.escalations()[0].contains("exclusive(\"sabor\")"));
+    // otro slot es otra linea, y descartar una conserva el indice de la otra
+    m.observe_at("other --sabor--> d", 130);
+    m.observe_at("other --sabor--> e", 140);
+    assert_eq!(m.escalations().len(), 2);
+    m.resolve_escalation(0);
+    assert_eq!(m.escalations().len(), 1);
+    assert!(m.escalations()[0].contains("other"));
+    // declarar la relacion ES la respuesta: se va sin resolve_escalation
+    m.install_rules("exclusive(\"sabor\").").unwrap();
+    assert!(
+        m.escalations().is_empty(),
+        "declarar la relacion cierra el aviso: {:?}",
+        m.escalations()
+    );
+}
+
+#[test]
+fn load_folds_a_per_value_queue_into_one_line_per_slot() {
+    let dir = std::env::temp_dir().join("lemmalog-test-fold");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("q.snapshot");
+    let path = path.to_str().unwrap();
+    let mut m = mem("");
+    m.observe_at("worker --sabor--> a", 100);
+    m.observe_at("worker --sabor--> b", 110);
+    m.observe_at("worker --sabor--> c", 120);
+    assert_eq!(m.escalations().len(), 1);
+    m.save(path).unwrap();
+    // cola escrita por el codigo viejo: una linea por valor anadido, sin remedio
+    let text = std::fs::read_to_string(path).unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("ESC\t"))
+        .expect("snapshot sin linea ESC")
+        .to_string();
+    let legacy = "ESC\tconflict: worker --sabor--> b asserted in ep1, but sabor also open (a)\n\
+                  ESC\tconflict: worker --sabor--> c asserted in ep2, but sabor also open (a, b)";
+    std::fs::write(path, text.replace(&line, legacy)).unwrap();
+    let m2 = AgentMemory::load(MockExtractor::new(0.9), path).unwrap();
+    assert_eq!(
+        m2.escalations().len(),
+        1,
+        "una linea por slot: {:?}",
+        m2.escalations()
+    );
+    let kept = &m2.escalations()[0];
+    assert!(kept.contains("ep2"), "sobrevive la mas completa: {kept}");
+    assert!(
+        kept.contains("fix: multi(\"sabor\")"),
+        "el remedio viaja con la linea: {kept}"
+    );
+    assert!(!kept.contains("ep1, but"), "la vieja se pliega, no se copia: {kept}");
+}

@@ -1,4 +1,4 @@
-use lemmalog::{AgentMemory, MockExtractor, Value};
+use lemmalog::{canonical::{assert_alias, install_canonicalization}, AgentMemory, MockExtractor, Value};
 
 fn mem(extra: &str) -> AgentMemory<MockExtractor> {
     AgentMemory::new(MockExtractor::new(0.9), extra).unwrap()
@@ -441,6 +441,43 @@ fn retract_propagates_through_derived_closures() {
     // a second retract of the same fact is a loud not-found, not a silent no-op
     let (_, missing2, _) = m.retract_facts("bob --manager--> carol");
     assert_eq!(missing2.len(), 1);
+}
+
+
+#[test]
+fn retract_facts_accepts_alias_and_reports_dead_canonical_views() {
+    let mut m = mem("");
+    m.observe_at("local --color--> blue", 100);
+    m.maintain(100);
+    install_canonicalization(&mut m.engine, &["current"]).unwrap();
+    assert_alias(&mut m.engine, "local", "canonical", 0.9);
+    assert_alias(&mut m.engine, "local", "canonical_two", 0.9);
+    m.engine.run();
+    assert_eq!(m.ask("current_canon(\"canonical\", \"color\", \"blue\")").unwrap().len(), 1);
+    assert_eq!(m.ask("current_canon(\"canonical_two\", \"color\", \"blue\")").unwrap().len(), 1);
+
+    let (done, missing, died) = m.retract_facts("local --alias--> canonical");
+    assert!(missing.is_empty(), "{missing:?}");
+    assert_eq!(done, vec!["local --alias--> canonical"]);
+    assert!(died.iter().any(|line| line.contains("current_canon")), "{died:?}");
+    assert!(m.ask("current_canon(\"canonical\", \"color\", \"blue\")").unwrap().is_empty());
+    assert_eq!(m.ask("current_canon(\"canonical_two\", \"color\", \"blue\")").unwrap().len(), 1);
+
+    let (done, missing, _) = m.retract_facts("local --alias_of--> canonical_two");
+    assert!(missing.is_empty(), "{missing:?}");
+    assert_eq!(done, vec!["local --alias_of--> canonical_two"]);
+    assert!(m.ask("current_canon(\"canonical_two\", \"color\", \"blue\")").unwrap().is_empty());
+    let (done, missing, died) = m.retract_facts("local --alias--> canonical_two");
+    assert!(done.is_empty() && died.is_empty());
+    assert_eq!(missing, vec!["local --alias--> canonical_two"]);
+
+    let path = std::env::temp_dir().join(format!("lemmalog-test-retract-alias-{}.snapshot", std::process::id()));
+    let path = path.to_str().unwrap();
+    m.save(path).unwrap();
+    let loaded = AgentMemory::load(MockExtractor::new(0.9), path).unwrap();
+    assert!(loaded.engine.query("alias", &[None, None]).is_empty());
+    assert!(loaded.ask("current_canon(\"canonical\", \"color\", \"blue\")").unwrap().is_empty());
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

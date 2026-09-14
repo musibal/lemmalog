@@ -164,14 +164,12 @@ impl Session {
         } else {
             self.engine.ask(&text).map_err(|e| format!("? : {e}"))?
         };
-        if rows.is_empty() {
-            return Ok("(no answers)\n".to_string());
+        // answer_text keeps a ground goal that HOLDS from rendering as an
+        // empty answer, which reads as "no such fact" (see Eval::answer_text)
+        match crate::answer_text(&rows) {
+            Some(text) => Ok(format!("{text}\n")),
+            None => Ok("(no answers)\n".to_string()),
         }
-        let mut out = String::new();
-        for r in rows {
-            let _ = writeln!(out, "{r}");
-        }
-        Ok(out)
     }
 
     fn why(&mut self, fact: &str) -> Result<String, String> {

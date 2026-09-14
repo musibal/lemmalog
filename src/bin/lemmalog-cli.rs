@@ -110,13 +110,10 @@ fn main() {
             let m = load(&snap_path());
             let goal = stdin_or_flag(&args, "--goal");
             match m.ask(&goal) {
-                Ok(rows) => {
-                    if rows.is_empty() {
-                        println!("(no answers — asserted facts are current(S, rel, O))");
-                    } else {
-                        println!("{}", rows.join("\n"));
-                    }
-                }
+                Ok(rows) => match lemmalog::answer_text(&rows) {
+                    Some(text) => println!("{text}"),
+                    None => println!("(no answers — asserted facts are current(S, rel, O))"),
+                },
                 Err(e) => {
                     eprintln!("parse: {e}\nhint: quote entity names — bare capitalized words are variables");
                     std::process::exit(1);

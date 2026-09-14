@@ -1112,17 +1112,14 @@ pub fn assemble_context(
 impl Engine {
     /// Non-mutating symbol lookup for read-only paths.
     pub fn sym_of(&self, s: &str) -> Value {
-        match self.interner.lookup(s) {
-            Some(v) => Value::Sym(v),
-            None => Value::Int(i64::MIN), // never matches: unknown entity
-        }
+        self.const_of(s).unwrap_or(Value::Int(i64::MIN)) // never matches: unknown entity
     }
 
     /// Resolve a pattern to ground values for `why()` (None if vars remain).
     pub fn ground_values(&self, pat: &[Term]) -> Option<Vec<Value>> {
         pat.iter()
             .map(|t| match t {
-                Term::Sym(s) => self.interner.lookup(s).map(Value::Sym),
+                Term::Sym(s) => self.const_of(s),
                 Term::Int(i) => Some(Value::Int(*i)),
                 _ => None,
             })

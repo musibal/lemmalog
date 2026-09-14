@@ -1523,6 +1523,24 @@ impl Engine {
         }
     }
 
+    /// The single reading of a symbol constant: the symbol the store knows
+    /// under that name, else the integer the name spells, else nothing.
+    ///
+    /// The store coerces digit-looking objects to `Int` and `display` prints
+    /// them bare, so `"3"` is how such a value is copied out of a result.
+    /// Used to be lookup-only per call site, so the index probe and the row
+    /// filter disagreed: a constant that named no symbol resolved to
+    /// "matches nothing" and the goal answered a false "no such fact" for a
+    /// fact that exists (measured 2026-09-15 on the live store:
+    /// `current("lemmalog_feeder", "coste", "3")` missed a row that the bare
+    /// `3` found; 413 `current` rows hold an Int object).
+    pub fn const_of(&self, name: &str) -> Option<Value> {
+        match self.interner.lookup(name) {
+            Some(sym) => Some(Value::Sym(sym)),
+            None => name.parse::<i64>().ok().map(Value::Int),
+        }
+    }
+
     /// Resolve a pattern's terms against env into concrete bound values
     /// (None = unbound). Unknown symbols resolve to a sentinel that matches
     /// nothing, so lookups short-circuit.
@@ -1532,10 +1550,8 @@ impl Engine {
                 Term::Int(i) => Some(Value::Int(*i)),
                 Term::Agg(..) => None, // never matches: aggregates are heads-only
                 Term::Var(v) => env.map.get(v).copied(),
-                Term::Sym(s) => match self.interner.lookup(s) {
-                    Some(sym) => Some(Value::Sym(sym)),
-                    None => Some(Value::Int(i64::MIN)), // unknown: matches nothing
-                },
+                // unknown names are the "matches nothing" sentinel
+                Term::Sym(s) => Some(self.const_of(s).unwrap_or(Value::Int(i64::MIN))),
                 Term::Wildcard => None,
             })
             .collect()
@@ -1561,7 +1577,7 @@ impl Engine {
         match t {
             Term::Var(_) => env.lookup(t),
             Term::Int(i) => Some(Value::Int(*i)),
-            Term::Sym(s) => self.interner.lookup(s).map(Value::Sym),
+            Term::Sym(s) => self.const_of(s),
             Term::Wildcard => None,
             Term::Agg(..) => None, // heads-only; never resolved in bodies
         }
@@ -1583,8 +1599,7 @@ impl Engine {
                     }
                 },
                 Term::Int(i) => Value::Int(*i) == *a,
-                Term::Sym(s) => matches!((self.interner.lookup(s), a),
-                    (Some(sv), Value::Sym(av)) if sv == *av),
+                Term::Sym(s) => self.const_of(s) == Some(*a),
             };
             if !ok {
                 return false;
@@ -1959,6 +1974,26 @@ fn reaches(deps: &HashMap<&str, Vec<(&str, bool)>>, from: &str, to: &str) -> boo
         }
     }
     false
+}
+
+/// Text form of an [`Engine::ask`] answer for surfaces that show a caller a
+/// string (MCP `lemmalog_query`, the CLI): `None` = no rows, `Some(text)` =
+/// the answer. A *ground* goal that HOLDS binds no variable, and `ask`
+/// reports it as one empty row, so the obvious `rows.join("\n")` yields "":
+/// an empty answer that every reader takes as "that fact does not exist"
+/// (measured 2026-09-15 on the live store: `multi("provee")` — 94 rows when
+/// asked free — answered nothing, while a genuine miss answers prose).
+/// Keep the distinction here, where the rows are still rows.
+pub fn answer_text(rows: &[String]) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    let text = rows.join("\n");
+    if text.is_empty() {
+        // every row is empty => the goal was ground and it holds
+        return Some("true — the ground goal holds (no variables to bind)".to_string());
+    }
+    Some(text)
 }
 
 fn cmp_holds(op: CmpOp, a: Value, b: Value) -> bool {    match op {

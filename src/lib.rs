@@ -48,7 +48,7 @@ pub use scenario::{run_eval, EvalReport, Scenario};
 pub use retrieval::{Bm25, Retrieval, Selection};
 pub use semantics::{Embedder, HashEmbedder, SemanticIndex, RELEVANCE_RULES};
 pub use ast::{parse_program, ParseError};
-pub use eval::{Ann, Change, Engine, StoredFact, StratError};
+pub use eval::{answer_text, Ann, Change, Engine, StoredFact, StratError};
 pub use intern::{Interner, Term, Value};
 
 impl Engine {

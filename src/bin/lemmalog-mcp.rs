@@ -516,10 +516,9 @@ fn tool_call(
         "lemmalog_query" => {
             let goal = args["goal"].as_str().unwrap_or_default().to_string();
             match engine_of(state).ask(&goal) {
-                Ok(rows) => Ok(if rows.is_empty() {
-                    empty_query_hint(engine_of(state), &goal)
-                } else {
-                    rows.join("\n")
+                Ok(rows) => Ok(match lemmalog::answer_text(&rows) {
+                    Some(text) => text,
+                    None => empty_query_hint(engine_of(state), &goal),
                 }),
                 Err(e) => Err(format!(
                     "parse: could not parse goal `{}`\nreason: {e}\nhint: quote entity names — bare capitalized words are variables. Example: reports_to(\"Alice\", Y)",
@@ -530,10 +529,9 @@ fn tool_call(
         "lemmalog_query_deep" => {
             let goal = args["goal"].as_str().unwrap_or_default().to_string();
             match engine_of(state).ask_deep(&goal) {
-                Ok(rows) => Ok(if rows.is_empty() {
-                    empty_query_hint(engine_of(state), &goal)
-                } else {
-                    rows.join("\n")
+                Ok(rows) => Ok(match lemmalog::answer_text(&rows) {
+                    Some(text) => text,
+                    None => empty_query_hint(engine_of(state), &goal),
                 }),
                 Err(e) => Err(format!(
                     "query: could not evaluate `{}`\nreason: {e}\nhint: quote entity names — bare capitalized words are variables. Example: reports_to(\"Alice\", Y)",
@@ -652,11 +650,8 @@ fn tool_call(
                 .map(|(p, a)| (p.as_str(), a.as_slice()))
                 .collect();
             match e.hypothetical(&refs, &goal) {
-                Ok(rows) => Ok(if rows.is_empty() {
-                    "(no answers)".to_string()
-                } else {
-                    rows.join("\n")
-                }),
+                Ok(rows) => Ok(lemmalog::answer_text(&rows)
+                    .unwrap_or_else(|| "(no answers)".to_string())),
                 Err(er) => Err(format!(
                     "query: could not evaluate `{}`\nreason: {er}\nhint: quote entity names — bare capitalized words are variables",
                     truncate(&goal, 120)

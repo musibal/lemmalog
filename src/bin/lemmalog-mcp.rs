@@ -13,6 +13,13 @@
 //! and asserts triples via `observe`; Lemmalog derives closures,
 //! temporal views, canonicalizations, aggregations and answers `query`
 //! and `why` deterministically.
+//!
+//! Time is bitemporal and the two clocks are kept apart: an `observe`
+//! carries the *valid-from* time of the facts it asserts, while every read
+//! path syncs the engine clock to the wall clock before deriving (see
+//! `sync_clock`). Reads therefore answer as of the present no matter what
+//! order episodes were ingested in, and backdating a batch cannot hide
+//! facts asserted after it.
 
 #![cfg(feature = "mcp")]
 
@@ -220,7 +227,7 @@ fn write_http_response(stream: &mut TcpStream, status: &str, body: &[u8]) -> std
 fn tools() -> J {
     json!([
         tool("lemmalog_observe",
-            "Assert facts into memory (host model does extraction). Input: facts in the line protocol 'S --rel[conf]--> O', one per line; optional ts integer (default: wall clock, never the logical clock). Example: 'Alice --works_at--> Acme\\nBob --manager--> Carol'.", &["facts", "ts"], &["facts"]),
+            "Assert facts into memory (host model does extraction). Input: facts in the line protocol 'S --rel[conf]--> O', one per line; optional ts integer = the facts' valid-from time (default: now). Backdating with ts is safe: it sets valid-time only, never the clock reads use. Example: 'Alice --works_at--> Acme\\nBob --manager--> Carol'.", &["facts", "ts"], &["facts"]),
         tool("lemmalog_retract",
             "Retract facts that turned out to be WRONG (line protocol, same as observe). Open matching rows are removed and invalidation propagates: the response reports which derived facts died as a consequence. For a value that merely CHANGED, prefer re-asserting the same relation (the update policy supersedes).", &["facts"], &["facts"]),
         tool("lemmalog_query",
@@ -248,7 +255,7 @@ fn tools() -> J {
         tool("lemmalog_changes",
             "Resync after a context reset or another agent's work: everything asserted, derived, or retracted since an epoch. Input: optional `since` epoch integer (default: 0 = everything, capped). The response carries the current epoch — checkpoint it and pass it back next time.", &["since"], &[]),
         tool("lemmalog_save", "Persist memory to LEMMALOG_MCP_PATH.", &[], &[]),
-        tool("lemmalog_run", "Run one maintenance epoch (usually automatic).", &[], &[]),
+        tool("lemmalog_run", "Sync the clock to the present and run one maintenance epoch (usually automatic — every read does it).", &[], &[]),
     ])
 }
 
@@ -311,8 +318,12 @@ fn tool(name: &str, desc: &str, props: &[&str], required: &[&str]) -> J {
 /// names arrive ground regardless of case.
 fn parse_fact_atom(s: &str) -> Result<(String, Vec<String>), String> {
     let s = s.trim().trim_end_matches('.');
-    let open = s.find('(').ok_or_else(|| format!("expected pred(args): {s:?}"))?;
-    let close = s.rfind(')').ok_or_else(|| format!("expected pred(args): {s:?}"))?;
+    let open = s
+        .find('(')
+        .ok_or_else(|| format!("expected pred(args): {s:?}"))?;
+    let close = s
+        .rfind(')')
+        .ok_or_else(|| format!("expected pred(args): {s:?}"))?;
     if close <= open {
         return Err(format!("expected pred(args): {s:?}"));
     }
@@ -333,6 +344,33 @@ fn parse_fact_atom(s: &str) -> Result<(String, Vec<String>), String> {
 
 fn engine_of(state: &mut State) -> &mut Engine {
     &mut state.memory.engine
+}
+
+/// Wall-clock seconds since the Unix epoch.
+fn wall_clock() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Advance the engine clock to the present and re-derive temporal views.
+///
+/// `now` is the *reader's* present, not a side effect of the last write.
+/// Without this, `engine.now` is whatever timestamp the last `observe`
+/// passed, so a backdated ingest silently hides every fact asserted at a
+/// later `ts` from `current/3` — the fact stays in `edge`, but fails the
+/// `VF =< T` guard. Reads sync forward; ingest keeps honouring its own
+/// `ts` as valid-time. The clock only ever moves forward here: a
+/// future-dated fact must not drag the present backwards.
+fn sync_clock(state: &mut State) {
+    let t = wall_clock();
+    let e = &mut state.memory.engine;
+    if t > e.now {
+        e.set_now(t);
+        e.invalidate_derived();
+        let _ = e.run();
+    }
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -371,8 +409,8 @@ facts are current(S, rel, O). Try current(X, \"{pred}\", Y)"
         .relations
         .keys()
         .filter(|r| !r.starts_with("__") && stem(r) == stem(pred))
-        .cloned()
         .take(5)
+        .cloned()
         .collect();
     if similar.is_empty() {
         format!(
@@ -388,12 +426,7 @@ Asserted facts live under current(S, rel, O)",
     }
 }
 
-fn tool_call(
-    state: &mut State,
-    name: &str,
-    args: &J,
-    path: Option<&str>,
-) -> Result<J, String> {
+fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Result<J, String> {
     // Input errors (bad goal syntax, rejected rules, unknown batch id)
     // return as tool results with isError: true so the model can
     // self-correct; JSON-RPC errors are reserved for unknown tools and
@@ -401,15 +434,25 @@ fn tool_call(
     let inner: Result<String, String> = match name {
         "lemmalog_observe" => {
             let facts = args["facts"].as_str().unwrap_or_default();
-            let ts = args["ts"].as_i64();
+            // No ts means "now" — the wall clock, never the engine clock,
+            // which is only ever a record of the last write.
+            let ts = args["ts"].as_i64().unwrap_or_else(wall_clock);
             let mem = &mut state.memory;
-            let t = mem.ts_or_wall_clock(ts);
-            let (report, dropped) = mem.observe_extracted(facts, t);
-            let now = mem.engine.now;
+            let (report, dropped) = mem.observe_extracted(facts, ts);
+            // Facts keep `ts` as their valid-time (VF), but the derived view
+            // is as of the present: backdating an episode must not rewind
+            // `current/3` past everything already asserted.
+            let now = wall_clock().max(mem.engine.now);
+            if now > mem.engine.now {
+                mem.engine.invalidate_derived();
+            }
             mem.maintain(now);
             let mut out = format!(
                 "added={} updated={} noop={} escalations={}",
-                report.added, report.updated, report.noop, report.escalations.len()
+                report.added,
+                report.updated,
+                report.noop,
+                report.escalations.len()
             );
             for e in report.escalations.iter().take(3) {
                 out.push_str(&format!("\nescalation: {e}"));
@@ -426,11 +469,7 @@ fn tool_call(
                     dropped.len()
                 ));
                 for (line, reason) in dropped.iter().take(5) {
-                    out.push_str(&format!(
-                        "\n  `{}` — {}",
-                        truncate(line, 80),
-                        reason
-                    ));
+                    out.push_str(&format!("\n  `{}` — {}", truncate(line, 80), reason));
                 }
                 if dropped.len() > 5 {
                     out.push_str(&format!("\n  (+{} more)", dropped.len() - 5));
@@ -443,6 +482,9 @@ fn tool_call(
             if facts.trim().is_empty() {
                 Err("input: `facts` is required — line-protocol facts to retract".to_string())
             } else {
+                // invalidation is computed against the derived view, so the
+                // clock has to be current before we decide what dies
+                sync_clock(state);
                 let (done, missing, died) = state.memory.retract_facts(facts);
                 let mut out = String::new();
                 if !done.is_empty() {
@@ -453,10 +495,7 @@ fn tool_call(
                     if died.is_empty() {
                         out.push_str("  no derived facts depended on them\n");
                     } else {
-                        out.push_str(&format!(
-                            "  {} derived fact(s) died:\n",
-                            died.len()
-                        ));
+                        out.push_str(&format!("  {} derived fact(s) died:\n", died.len()));
                         for d in died.iter().take(15) {
                             out.push_str(&format!("    {d}\n"));
                         }
@@ -482,6 +521,7 @@ fn tool_call(
         }
         "lemmalog_changes" => {
             let since = args["since"].as_i64().unwrap_or(0).max(0) as u64;
+            sync_clock(state);
             let e = engine_of(state);
             let events = e.changes_since(since);
             let epoch = e.epoch();
@@ -507,14 +547,13 @@ fn tool_call(
                 if events.len() > shown {
                     out.push_str(&format!("(+{} more)\n", events.len() - shown));
                 }
-                out.push_str(&format!(
-                    "checkpoint: pass since={epoch} next time"
-                ));
+                out.push_str(&format!("checkpoint: pass since={epoch} next time"));
             }
             Ok(out)
         }
         "lemmalog_query" => {
             let goal = args["goal"].as_str().unwrap_or_default().to_string();
+            sync_clock(state);
             match engine_of(state).ask(&goal) {
                 Ok(rows) => Ok(match lemmalog::answer_text(&rows) {
                     Some(text) => text,
@@ -528,6 +567,7 @@ fn tool_call(
         }
         "lemmalog_query_deep" => {
             let goal = args["goal"].as_str().unwrap_or_default().to_string();
+            sync_clock(state);
             match engine_of(state).ask_deep(&goal) {
                 Ok(rows) => Ok(match lemmalog::answer_text(&rows) {
                     Some(text) => text,
@@ -541,6 +581,7 @@ fn tool_call(
         }
         "lemmalog_why" => {
             let fact = args["fact"].as_str().unwrap_or_default().to_string();
+            sync_clock(state);
             match parse_fact_atom(&fact) {
                 Ok((pred, parts)) => {
                     let vals: Vec<Value> = parts
@@ -552,21 +593,21 @@ fn tool_call(
                         .collect();
                     Ok(state.memory.engine.why(&pred, &vals))
                 }
-                Err(e) => Err(format!(
-                    "input: {e}\nexample: reports_to(Alice, Carol)"
-                )),
+                Err(e) => Err(format!("input: {e}\nexample: reports_to(Alice, Carol)")),
             }
         }
         "lemmalog_install_rules" => {
             let rules = args["rules"].as_str().unwrap_or_default();
-            match engine_of(state).install_program(rules) {
+            sync_clock(state);
+            match state.memory.install_rules(rules) {
                 Ok(id) => {
                     let n = engine_of(state).run();
-                    // a multi()/exclusive() declaration answers the queued
-                    // warnings about that relation; close them here (the
-                    // queue is a cache, the declaration is the fix)
-                    let purged = state.memory.purge_declared_escalations();
-                    Ok(format!("installed {id}; backfill derived +{n} facts; queue purged {purged}"))
+let purged = state.memory.purge_declared_escalations();
+                    let mut out = format!("installed {id}; backfill derived +{n} facts; queue purged {purged}");
+                    for w in state.memory.batch_conflicts(&id) {
+                        out.push_str(&format!("\nWARNING: {w}"));
+                    }
+                    Ok(out)
                 }
                 Err(e) => Err(format!(
                     "rules rejected — nothing installed:\n{e}\ncommon causes: recursion through negation; aggregates outside rule heads; parse errors (rules end with '.')"
@@ -575,6 +616,7 @@ fn tool_call(
         }
         "lemmalog_uninstall" => {
             let id = args["id"].as_str().unwrap_or_default().to_string();
+            sync_clock(state);
             if engine_of(state).uninstall(&id) {
                 let _ = engine_of(state).run();
                 Ok(format!("uninstalled {id}; derivations recomputed"))
@@ -634,6 +676,7 @@ fn tool_call(
                     "isError": true
                 }));
             }
+            sync_clock(state);
             let e = engine_of(state);
             let now = e.now;
             let mut extra: Vec<(String, Vec<Value>)> = Vec::new();
@@ -642,7 +685,9 @@ fn tool_call(
                 extra.push((
                     "edge".to_string(),
                     vec![
-                        s, p, o,
+                        s,
+                        p,
+                        o,
                         Value::Int(now),
                         Value::Int(i64::MAX),
                         Value::Int(now),
@@ -674,6 +719,7 @@ fn tool_call(
                     "isError": true
                 }));
             }
+            sync_clock(state);
             let e = engine_of(state);
             for c in &aliases {
                 canonical::assert_alias(e, &c.subj, &c.obj, c.confidence);
@@ -692,9 +738,7 @@ fn tool_call(
                         ))
                     }
                 }
-                Err(er) => Err(format!(
-                    "canonicalization rejected: {er}"
-                )),
+                Err(er) => Err(format!("canonicalization rejected: {er}")),
             }
         }
         "lemmalog_context" => {
@@ -703,11 +747,13 @@ fn tool_call(
             if query.trim().is_empty() {
                 Err("input: `query` is required — the natural-language question the context should serve".to_string())
             } else {
+                sync_clock(state);
                 Ok(state.memory.context_for_query_rich(&query, budget))
             }
         }
         "lemmalog_dump" => {
             let pred = args["pred"].as_str().unwrap_or_default();
+            sync_clock(state);
             let e = engine_of(state);
             let mut preds: Vec<&String> = e.relations.keys().collect();
             preds.sort();
@@ -735,8 +781,9 @@ fn tool_call(
             }
         }
         "lemmalog_run" => {
+            sync_clock(state);
             let n = engine_of(state).run();
-            Ok(format!("+{n} facts"))
+            Ok(format!("+{n} facts (clock {})", engine_of(state).now))
         }
         other => {
             // models invent tool names; teach instead of rejecting —

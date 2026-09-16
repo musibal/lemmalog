@@ -120,6 +120,16 @@ claude mcp add lemmalog -- $(pwd)/target/release/lemmalog-mcp
 kimi mcp add lemmalog -- $(pwd)/target/release/lemmalog-mcp
 ```
 
+Or the one-command installer (builds, registers the MCP server with
+every supported CLI it finds, installs the skill):
+
+```sh
+./scripts/install.sh               # install
+./scripts/install.sh --uninstall   # remove registrations + skill
+```
+
+Memory persists at `$LEMMALOG_SNAPSHOT` (default `~/.lemmalog/memory.snap`).
+
 Persistence across sessions: set the environment when registering
 (both CLIs support `--env KEY=VALUE` on add):
 

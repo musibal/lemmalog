@@ -46,7 +46,10 @@ fn main() {
     m.observe_at("code_audit --found--> benign_flag_disabled", 160); // ep4
     m.maintain(160);
 
-    println!("== after 4 observations ({} ms) ==", t0.elapsed().as_millis());
+    println!(
+        "== after 4 observations ({} ms) ==",
+        t0.elapsed().as_millis()
+    );
     for pred in ["primitive_reachable", "target_mapping", "exploit_viable"] {
         let rows = m.engine.query(pred, &[]);
         for (k, _) in rows {
@@ -74,10 +77,9 @@ fn main() {
     for (rel_name, ts) in [("maps_target", 120i64), ("confirms_mapping", 140)] {
         let rel = m.engine.sym(rel_name);
         let ac = m.engine.sym("attacker_controlled");
-        let rows = m.engine.query(
-            "edge",
-            &[None, Some(rel), Some(ac), None, None, None],
-        );
+        let rows = m
+            .engine
+            .query("edge", &[None, Some(rel), Some(ac), None, None, None]);
         for (k, _) in rows {
             if k[5].as_int() == Some(ts) {
                 let retracted = m.engine.retract("edge", &k);
@@ -94,7 +96,10 @@ fn main() {
 
     // ---- the aftermath: what still holds? ----
     println!("\n== after retraction ==");
-    let gone = m.engine.query("decision", &[Some(escalate), Some(wp)]).is_empty();
+    let gone = m
+        .engine
+        .query("decision", &[Some(escalate), Some(wp)])
+        .is_empty();
     let viable_gone = m.engine.query("exploit_viable", &[]).is_empty();
     let still_supported = m.engine.query("supported", &[Some(h)]).len() == 1;
     let still_refuted = m.engine.query("refuted", &[Some(flag)]).len() == 1;
@@ -104,15 +109,27 @@ fn main() {
     );
     println!(
         "exploit_viable(write_phys): {}",
-        if viable_gone { "gone" } else { "STILL PRESENT (bug)" }
+        if viable_gone {
+            "gone"
+        } else {
+            "STILL PRESENT (bug)"
+        }
     );
     println!(
         "supported(h_auth_bypass):  {}  <-- hypothesis survives: its own evidence is intact",
-        if still_supported { "present" } else { "GONE (bug)" }
+        if still_supported {
+            "present"
+        } else {
+            "GONE (bug)"
+        }
     );
     println!(
         "refuted(h_benign_flag):    {}  <-- refutation unaffected",
-        if still_refuted { "present" } else { "GONE (bug)" }
+        if still_refuted {
+            "present"
+        } else {
+            "GONE (bug)"
+        }
     );
     println!(
         "\nThe decision was never deleted. It was a CONSEQUENCE, and\n\

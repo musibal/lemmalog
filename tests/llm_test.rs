@@ -17,13 +17,18 @@ fn ok_transport(content: &str) -> Box<dyn Fn(&str) -> Result<String, String> + S
 
 #[test]
 fn chat_strips_reasoning_artifacts() {
-    let c = OpenAiClient::with_transport(ok_transport("<think>hmm</think>Alice --works_at--> Acme"), "m");
+    let c = OpenAiClient::with_transport(
+        ok_transport("<think>hmm</think>Alice --works_at--> Acme"),
+        "m",
+    );
     let out = c.chat("sys", "usr").unwrap();
     assert_eq!(out, "Alice --works_at--> Acme");
 
     let c2 = OpenAiClient::with_transport(
-        ok_transport("prefix <think>chain
-of thought</think> answer"),
+        ok_transport(
+            "prefix <think>chain
+of thought</think> answer",
+        ),
         "m",
     );
     assert_eq!(c2.chat("s", "u").unwrap(), "prefix  answer");
@@ -86,7 +91,10 @@ speaker --works_at--> Gigant Systems";
 #[test]
 fn longmemeval_scoring() {
     use lemmalog::longmemeval::score_f1;
-    let (f1, em) = score_f1("GPS system not functioning correctly", "the GPS system is not functioning correctly");
+    let (f1, em) = score_f1(
+        "GPS system not functioning correctly",
+        "the GPS system is not functioning correctly",
+    );
     assert!(f1 > 0.85, "{f1}");
     assert!(em, "stopword-stripped equality");
     let (f1, em) = score_f1("Samsung Galaxy S22", "iPhone 13");
@@ -98,7 +106,10 @@ fn longmemeval_scoring() {
 #[test]
 fn longmemeval_loader_parses_fixture() {
     use lemmalog::longmemeval::{load, parse_date};
-    assert_eq!(parse_date("2023/04/10 (Mon) 17:50"), parse_date("2023/04/10 (Mon) 17:50"));
+    assert_eq!(
+        parse_date("2023/04/10 (Mon) 17:50"),
+        parse_date("2023/04/10 (Mon) 17:50")
+    );
     assert!(parse_date("2023/05/01 (Mon) 09:00") > parse_date("2023/04/10 (Mon) 17:50"));
     let dir = std::env::temp_dir().join("lemmalog-lme");
     std::fs::create_dir_all(&dir).unwrap();
@@ -172,11 +183,20 @@ fn subject_question_matching_is_whole_token() {
     let q = "Which device did I get first, the Samsung Galaxy S22 or the Dell XPS 13?";
     assert!(subject_matches_question("Samsung Galaxy S22", q));
     assert!(subject_matches_question("Dell XPS 13", q));
-    assert!(!subject_matches_question("Rachel", q), "unrelated subject: no shared token");
-    assert!(!subject_matches_question("art", q), "short/stopword-adjacent tokens don't match");
+    assert!(
+        !subject_matches_question("Rachel", q),
+        "unrelated subject: no shared token"
+    );
+    assert!(
+        !subject_matches_question("art", q),
+        "short/stopword-adjacent tokens don't match"
+    );
     // the old bug: two-way raw substring pulled in everything via words
     // like "the"/"did" — whole-token matching must not
-    assert!(!subject_matches_question("theater", q), "'the' + substring must not match 'theater'");
+    assert!(
+        !subject_matches_question("theater", q),
+        "'the' + substring must not match 'theater'"
+    );
 }
 
 #[test]

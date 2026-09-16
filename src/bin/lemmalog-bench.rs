@@ -27,7 +27,7 @@ use lemmalog::canonical;
 use lemmalog::eval::Engine;
 use lemmalog::intern::Value;
 use lemmalog::llm::{LlmClientExtractor, OpenAiClient};
-use lemmalog::retrieval::{stem3, tokens3, topic_overlap, tokenize_pub, Retrieval};
+use lemmalog::retrieval::{stem3, tokenize_pub, tokens3, topic_overlap, Retrieval};
 use lemmalog::semantics::Embedder as _;
 use serde_json::Value as J;
 use std::collections::BTreeMap;
@@ -53,8 +53,10 @@ fn main() {
         }
         Some("hasevidence") => {
             let (snap, question) = (
-                args.get(2).expect("usage: hasevidence <snapshot> <question>"),
-                args.get(3).expect("usage: hasevidence <snapshot> <question>"),
+                args.get(2)
+                    .expect("usage: hasevidence <snapshot> <question>"),
+                args.get(3)
+                    .expect("usage: hasevidence <snapshot> <question>"),
             );
             let mut m = AgentMemory::load(MockExtractor::new(0.9), snap).expect("load snapshot");
             let _ = m.maintain(m.engine.now);
@@ -103,8 +105,18 @@ fn parse_date(s: &str) -> i64 {
     }
     // raw LoCoMo: "1:56 pm on 8 May, 2023"
     const MONTHS: [&str; 12] = [
-        "january", "february", "march", "april", "may", "june", "july",
-        "august", "september", "october", "november", "december",
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
     ];
     let lower = s.to_lowercase();
     if let Some(pos) = lower.find(" on ") {
@@ -134,8 +146,8 @@ stated_before(X, Y) :- current(X, \"before\", Y).\n\
 stated_before(X, Z) :- stated_before(X, Y), stated_before(Y, Z).\n";
 
 fn client() -> OpenAiClient {
-    let model = std::env::var("LEMMALOG_EXTRACT_MODEL")
-        .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
+    let model =
+        std::env::var("LEMMALOG_EXTRACT_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
     OpenAiClient::new("https://api.anthropic.com/v1", &model, "")
 }
 
@@ -189,7 +201,8 @@ fn ingest(conv_path: &str, snap: &str) {
     );
 
     let base = client();
-    let extractor = LlmClientExtractor::new(base).with_prompt(lemmalog::longmemeval::OPEN_VOCAB_PROMPT);
+    let extractor =
+        LlmClientExtractor::new(base).with_prompt(lemmalog::longmemeval::OPEN_VOCAB_PROMPT);
     let extractor: Box<dyn lemmalog::agent::Extractor> = match std::env::var("LEMMALOG_CACHE_DIR") {
         Ok(dir) => Box::new(extractor.file_cached(&dir)),
         Err(_) => Box::new(extractor),
@@ -218,10 +231,11 @@ fn ingest(conv_path: &str, snap: &str) {
         let obj = m.engine.interner.display(&key[2]).to_string();
         if let Some(n) = lemmalog::longmemeval::date_to_int(&obj) {
             let subj = key[0];
-            if m
-                .engine
-                .declare("dated", &[subj, Value::Int(n)], lemmalog::eval::Ann::base(0.95, ["date_norm"]))
-            {
+            if m.engine.declare(
+                "dated",
+                &[subj, Value::Int(n)],
+                lemmalog::eval::Ann::base(0.95, ["date_norm"]),
+            ) {
                 dated_count += 1;
             }
         }
@@ -242,10 +256,11 @@ fn ingest(conv_path: &str, snap: &str) {
             && lemmalog::longmemeval::date_to_int(&obj).is_none();
         if is_plain_number {
             let n: i64 = obj.parse().unwrap_or(0);
-            if m
-                .engine
-                .declare("numeric", &[key[0], key[1], Value::Int(n)], lemmalog::eval::Ann::base(0.95, ["num_norm"]))
-            {
+            if m.engine.declare(
+                "numeric",
+                &[key[0], key[1], Value::Int(n)],
+                lemmalog::eval::Ann::base(0.95, ["num_norm"]),
+            ) {
                 numeric_count += 1;
             }
         }
@@ -305,9 +320,9 @@ fn reconcile(e: &mut Engine, embed: Option<&str>) -> Vec<(String, String, f64)> 
             return;
         }
         let flipped = (a.clone(), b.clone());
-        let seen = pairs.iter().any(|(x, y)| {
-            (x == &a && y == &b) || (x == &flipped.0 && y == &flipped.1)
-        });
+        let seen = pairs
+            .iter()
+            .any(|(x, y)| (x == &a && y == &b) || (x == &flipped.0 && y == &flipped.1));
         if !seen {
             pairs.push((a, b));
         }
@@ -350,10 +365,8 @@ fn reconcile(e: &mut Engine, embed: Option<&str>) -> Vec<(String, String, f64)> 
     // 3. embedding-similar pairs (local nomic): cosine gate, as in
     // canonical::reconcile — semantic near-duplicates the string passes miss
     if let Some(base) = embed {
-        let embedder = lemmalog::llm::HttpEmbedder::new(
-            base,
-            "text-embedding-nomic-embed-text-v1.5",
-        );
+        let embedder =
+            lemmalog::llm::HttpEmbedder::new(base, "text-embedding-nomic-embed-text-v1.5");
         let vecs: Vec<Vec<f32>> = names.iter().map(|n| embedder.embed(n)).collect();
         if !vecs.iter().any(|v| v.is_empty()) {
             for i in 0..names.len() {
@@ -418,10 +431,11 @@ fn evidence_lines(m: &AgentMemory<MockExtractor>, snap: &str, question: &str) ->
     let qt = tokens3(question);
     let mut scored: Vec<(f64, String)> = Vec::new();
     // semantic half: reuse the per-snapshot embedding cache if present
-    let embeds: std::collections::HashMap<String, Vec<f32>> = std::fs::read_to_string(format!("{snap}.embed.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let embeds: std::collections::HashMap<String, Vec<f32>> =
+        std::fs::read_to_string(format!("{snap}.embed.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
     let qvec = embed_base().map(|b| {
         let e = lemmalog::llm::HttpEmbedder::new(&b, "text-embedding-nomic-embed-text-v1.5");
         e.embed(question)
@@ -573,7 +587,9 @@ fn count_section(m: &mut AgentMemory<MockExtractor>, question: &str) -> String {
                 // relevance filter: the count line (relation name) must
                 // share a stemmed token with the question
                 let line = m.engine.render_fact(pred, &key);
-                let shares = tokens3(&line).iter().any(|t| t.len() >= 3 && qtokens.contains(t));
+                let shares = tokens3(&line)
+                    .iter()
+                    .any(|t| t.len() >= 3 && qtokens.contains(t));
                 if !shares {
                     continue;
                 }
@@ -606,8 +622,16 @@ fn count_section(m: &mut AgentMemory<MockExtractor>, question: &str) -> String {
                 // watched/read/sold/removed is not current membership —
                 // "to-watch list" counts what is still pending
                 const CONSUMED: [&str; 10] = [
-                    "watched", "read", "finished", "sold", "removed",
-                    "gave", "donated", "completed", "returned", "cancel",
+                    "watched",
+                    "read",
+                    "finished",
+                    "sold",
+                    "removed",
+                    "gave",
+                    "donated",
+                    "completed",
+                    "returned",
+                    "cancel",
                 ];
                 let consumed: Vec<String> = merged
                     .iter()
@@ -658,7 +682,12 @@ fn count_section(m: &mut AgentMemory<MockExtractor>, question: &str) -> String {
                 } else if !merged.is_empty() {
                     out.push_str(&format!(
                         "{line}: {}\n",
-                        merged.iter().take(10).cloned().collect::<Vec<_>>().join("; ")
+                        merged
+                            .iter()
+                            .take(10)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("; ")
                     ));
                 } else {
                     out.push_str(&format!("{line}\n"));
@@ -683,7 +712,9 @@ fn count_section(m: &mut AgentMemory<MockExtractor>, question: &str) -> String {
         for key in m.engine.relation_keys(pred) {
             if key.len() == 2 && key[0] == user_sym {
                 let line = m.engine.render_fact(pred, &key);
-                let shares = tokens3(&line).iter().any(|t| t.len() >= 3 && qtokens.contains(t));
+                let shares = tokens3(&line)
+                    .iter()
+                    .any(|t| t.len() >= 3 && qtokens.contains(t));
                 if !shares {
                     continue;
                 }
@@ -693,9 +724,7 @@ fn count_section(m: &mut AgentMemory<MockExtractor>, question: &str) -> String {
                     .relation_keys("numeric")
                     .into_iter()
                     .filter(|k| {
-                        k.len() == 3
-                            && k[0] == user_sym
-                            && m.engine.interner.display(&k[1]) == rel
+                        k.len() == 3 && k[0] == user_sym && m.engine.interner.display(&k[1]) == rel
                     })
                     .map(|k| m.engine.interner.display(&k[2]).to_string())
                     .collect();
@@ -728,7 +757,9 @@ fn count_section(m: &mut AgentMemory<MockExtractor>, question: &str) -> String {
             }
             let ts = key[5].as_int().unwrap_or(0);
             let rel_disp = m.engine.interner.display(&key[1]).to_string();
-            let shares = tokens3(&rel_disp).iter().any(|t| t.len() >= 3 && qtokens.contains(t));
+            let shares = tokens3(&rel_disp)
+                .iter()
+                .any(|t| t.len() >= 3 && qtokens.contains(t));
             if !shares {
                 continue;
             }
@@ -752,15 +783,13 @@ fn count_section(m: &mut AgentMemory<MockExtractor>, question: &str) -> String {
 /// embedding endpoint is off or unreachable (plain BM25 selection).
 fn semantic_embeds(snap: &str, r: &Retrieval, question: &str) -> Option<(Vec<Vec<f32>>, Vec<f32>)> {
     let base = embed_base()?;
-    let embedder = lemmalog::llm::HttpEmbedder::new(
-        &base,
-        "text-embedding-nomic-embed-text-v1.5",
-    );
+    let embedder = lemmalog::llm::HttpEmbedder::new(&base, "text-embedding-nomic-embed-text-v1.5");
     let cache_path = format!("{snap}.embed.json");
-    let mut cache: std::collections::HashMap<String, Vec<f32>> = std::fs::read_to_string(&cache_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut cache: std::collections::HashMap<String, Vec<f32>> =
+        std::fs::read_to_string(&cache_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
     let renders = r.fact_renders();
     let mut embeds: Vec<Vec<f32>> = Vec::with_capacity(renders.len());
     let mut missing = 0usize;
@@ -780,7 +809,10 @@ fn semantic_embeds(snap: &str, r: &Retrieval, question: &str) -> Option<(Vec<Vec
         embeds.push(v);
     }
     if missing > 0 {
-        let _ = std::fs::write(&cache_path, serde_json::to_string(&cache).unwrap_or_default());
+        let _ = std::fs::write(
+            &cache_path,
+            serde_json::to_string(&cache).unwrap_or_default(),
+        );
     }
     let q = embedder.embed(question);
     if q.is_empty() {
@@ -855,8 +887,10 @@ fn context(snap: &str, question: &str) -> String {
         }
     };
     // budgeted dated-history append, whole-token subject matching
-    let qtokens: std::collections::BTreeSet<String> =
-        tokenize_pub(question).into_iter().filter(|t| t.len() >= 3).collect();
+    let qtokens: std::collections::BTreeSet<String> = tokenize_pub(question)
+        .into_iter()
+        .filter(|t| t.len() >= 3)
+        .collect();
     let mut hist = String::new();
     for key in m.engine.relation_keys("edge") {
         if hist.len() > 700 * 4 {
@@ -893,11 +927,7 @@ fn context(snap: &str, question: &str) -> String {
         .relation_keys("alias")
         .iter()
         .filter_map(|k| {
-            let conf = m
-                .engine
-                .fact("alias", k)
-                .map(|f| f.ann.conf)
-                .unwrap_or(0.0);
+            let conf = m.engine.fact("alias", k).map(|f| f.ann.conf).unwrap_or(0.0);
             if conf < 0.9 {
                 return None;
             }
@@ -1028,8 +1058,16 @@ fn context(snap: &str, question: &str) -> String {
     // arithmetic
     let q_lower = question.to_lowercase();
     let wants_dates = [
-        "how many days", "how many months", "how long", "before", "after",
-        "ago", "between", "when did", "what date", "which day",
+        "how many days",
+        "how many months",
+        "how long",
+        "before",
+        "after",
+        "ago",
+        "between",
+        "when did",
+        "what date",
+        "which day",
     ]
     .iter()
     .any(|p| q_lower.contains(p));
@@ -1063,19 +1101,14 @@ fn context(snap: &str, question: &str) -> String {
         }
         date_facts.truncate(6);
         if !date_facts.is_empty() {
-            let mut sec = String::from(
-                "\nDATE FACTS (facts carrying dates; differences computed):\n",
-            );
+            let mut sec =
+                String::from("\nDATE FACTS (facts carrying dates; differences computed):\n");
             // reference ymd from the sidecar date string ("2023/05/30 ...")
             let ref_ymd = reference_date.as_ref().and_then(|d| {
-                d.split_whitespace()
-                    .next()
-                    .and_then(|p| {
-                        let dp: Vec<i64> =
-                            p.split('/').filter_map(|x| x.parse().ok()).collect();
-                        (dp.len() == 3)
-                            .then(|| dp[0] * 10000 + dp[1] * 100 + dp[2])
-                    })
+                d.split_whitespace().next().and_then(|p| {
+                    let dp: Vec<i64> = p.split('/').filter_map(|x| x.parse().ok()).collect();
+                    (dp.len() == 3).then(|| dp[0] * 10000 + dp[1] * 100 + dp[2])
+                })
             });
             for (line, ymd) in &date_facts {
                 if let Some(r) = ref_ymd {
@@ -1138,7 +1171,10 @@ fn context(snap: &str, question: &str) -> String {
             let rel = m.engine.interner.display(&key[1]).to_string();
             let line = format!("{subj} --{rel}--> {}", m.engine.interner.display(&key[2]));
             // only slots the question touches
-            if !tokens3(&line).iter().any(|t| t.len() >= 3 && qt_cur.contains(t)) {
+            if !tokens3(&line)
+                .iter()
+                .any(|t| t.len() >= 3 && qt_cur.contains(t))
+            {
                 continue;
             }
             let vf = key[3].as_int().unwrap_or(0);
@@ -1159,15 +1195,15 @@ fn context(snap: &str, question: &str) -> String {
                 break;
             }
             vals.sort_by(|a, b| b.0.cmp(&a.0));
-            let distinct: Vec<String> = vals
-                .iter()
-                .map(|(_, v)| v.clone())
-                .fold(Vec::new(), |mut acc: Vec<String>, v| {
-                    if !acc.contains(&v) {
-                        acc.push(v);
-                    }
-                    acc
-                });
+            let distinct: Vec<String> =
+                vals.iter()
+                    .map(|(_, v)| v.clone())
+                    .fold(Vec::new(), |mut acc: Vec<String>, v| {
+                        if !acc.contains(&v) {
+                            acc.push(v);
+                        }
+                        acc
+                    });
             if distinct.len() < 2 {
                 continue;
             }
@@ -1180,11 +1216,24 @@ fn context(snap: &str, question: &str) -> String {
                     .cloned()
                     .unwrap_or_else(|| ts.to_string())
             };
-            let newest_ts = vals.iter().find(|(_, v)| v == &distinct[0]).map(|(t, _)| *t).unwrap_or(0);
-            let mut older: Vec<String> = distinct.iter().skip(1).take(3).map(|v| {
-                let ts = vals.iter().find(|(_, x)| x == v).map(|(t, _)| *t).unwrap_or(0);
-                format!("{v} (as of {})", date_of(ts))
-            }).collect();
+            let newest_ts = vals
+                .iter()
+                .find(|(_, v)| v == &distinct[0])
+                .map(|(t, _)| *t)
+                .unwrap_or(0);
+            let mut older: Vec<String> = distinct
+                .iter()
+                .skip(1)
+                .take(3)
+                .map(|v| {
+                    let ts = vals
+                        .iter()
+                        .find(|(_, x)| x == v)
+                        .map(|(t, _)| *t)
+                        .unwrap_or(0);
+                    format!("{v} (as of {})", date_of(ts))
+                })
+                .collect();
             let _ = &mut older;
             sec.push_str(&format!(
                 "  {subj} --{rel}--> {} (as of {}; superseded: {})\n",

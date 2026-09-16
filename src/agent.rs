@@ -10,8 +10,9 @@
 //! mitigation) under a token budget.
 
 use crate::eval::{Ann, Engine};
-use crate::intern::Value;
 use crate::intern::Term;
+use crate::intern::Value;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -93,8 +94,8 @@ fn entity_token_problem(s: &str) -> Option<String> {
     // unresolved-reference words: pronouns and role placeholders that mean
     // the model failed to resolve the entity
     const BLOCKED: [&str; 14] = [
-        "i", "me", "my", "mine", "speaker", "user", "they", "them", "he", "she",
-        "it", "we", "you", "that",
+        "i", "me", "my", "mine", "speaker", "user", "they", "them", "he", "she", "it", "we", "you",
+        "that",
     ];
     let lower = s.to_lowercase();
     if s.is_empty() {
@@ -257,8 +258,12 @@ pub fn parse_protocol_reported(
 /// The model is asked to answer in the line protocol `S --rel--> O`
 /// (optionally `S --rel[0.8]--> O`). Extraction failures degrade to zero
 /// facts rather than poisoning memory.
+/// The model call an [`LlmExtractor`] drives: a prompt in, the model's raw
+/// reply or an error message out.
+type LlmCall = Box<dyn FnMut(&str) -> Result<String, String>>;
+
 pub struct LlmExtractor {
-    call: Box<dyn FnMut(&str) -> Result<String, String>>,
+    call: LlmCall,
     default_confidence: f64,
     seen: HashMap<String, Vec<CandidateFact>>,
     pub calls: usize, // observability for tests/metrics
@@ -479,7 +484,8 @@ impl<X: Extractor> AgentMemory<X> {
                 let mut closed = old.clone();
                 closed[4] = Value::Int(self.engine.now);
                 self.engine.retract("edge", old);
-                self.engine.declare("edge", &closed, Ann::base(0.9, ["superseded"]));
+                self.engine
+                    .declare("edge", &closed, Ann::base(0.9, ["superseded"]));
             }
             self.assert_open(&[subj, pred, obj], c.confidence, &ep.id);
             report.updated += 1;
@@ -726,6 +732,53 @@ impl<X: Extractor> AgentMemory<X> {
         Ok(id)
     }
 
+    /// Predicates this batch (co-)defines that another installed batch
+    /// ALSO defines. Datalog union semantics keep both rules active, so
+    /// installing a "corrected" rule without uninstalling the old one
+    /// silently preserves the old derivations — this makes the
+    /// shadow-definition visible at install time instead.
+    pub fn batch_conflicts(&self, id: &str) -> Vec<String> {
+        let batches = &self.engine.rule_batches;
+        let Some(pos) = batches.iter().position(|(b, _, _)| b == id) else {
+            return Vec::new();
+        };
+        // clause ranges: [prev_end, end) per batch (0 for the first)
+        let ends: Vec<usize> = batches.iter().map(|(_, _, e)| *e).collect();
+        let lo = |i: usize| -> usize {
+            if i == 0 {
+                0
+            } else {
+                ends[i - 1]
+            }
+        };
+        let head_preds = |rng: std::ops::Range<usize>| -> Vec<String> {
+            self.engine.clauses[rng]
+                .iter()
+                .filter(|c| !c.is_fact)
+                .map(|c| c.head.pred.clone())
+                .collect()
+        };
+        let mine: Vec<String> = head_preds(lo(pos)..ends[pos]);
+        let mut out = Vec::new();
+        for p in &mine {
+            let co_definers: Vec<String> = batches
+                .iter()
+                .enumerate()
+                .filter(|(i, (b, _, _))| {
+                    *i != pos && *b != id && head_preds(lo(*i)..ends[*i]).contains(p)
+                })
+                .map(|(_, (b, _, _))| b.clone())
+                .collect();
+            if !co_definers.is_empty() {
+                out.push(format!(
+                    "{p} is also defined by batch(es) {} — the definitions UNION; uninstall those if this was a replacement",
+                    co_definers.join(", ")
+                ));
+            }
+        }
+        out
+    }
+
     /// Agent tool surface: uninstall a rule batch; derivations revert on
     /// the next `maintain()`.
     pub fn uninstall_rules(&mut self, id: &str) -> bool {
@@ -789,7 +842,8 @@ impl<X: Extractor> AgentMemory<X> {
         session: crate::intern::Value,
         entity: crate::intern::Value,
     ) -> Vec<(Vec<crate::intern::Value>, crate::eval::Ann)> {
-        self.engine.query("near", &[Some(session), Some(entity), None])
+        self.engine
+            .query("near", &[Some(session), Some(entity), None])
     }
 
     /// Demand-driven query (magic sets): answers without materializing the
@@ -856,10 +910,7 @@ impl<X: Extractor> AgentMemory<X> {
     /// (retracted lines, not-found lines, derived facts that died) —
     /// the consequence report is the point: the caller sees exactly
     /// what invalidation propagated.
-    pub fn retract_facts(
-        &mut self,
-        text: &str,
-    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+    pub fn retract_facts(&mut self, text: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
         let candidates = parse_protocol_strict(text, 0.9);
         let mut done = Vec::new();
         let mut missing = Vec::new();
@@ -895,6 +946,7 @@ impl<X: Extractor> AgentMemory<X> {
                         .collect(),
                 )
             };
+
             if open.is_empty() {
                 missing.push(format!("{} --{}--> {}", c.subj, c.pred, c.obj));
                 continue;
@@ -1016,7 +1068,10 @@ impl<X: Extractor> AgentMemory<X> {
                 }
                 let subj = self.engine.interner.display(&key[0]).to_string();
                 let rel = self.engine.interner.display(&key[1]).to_string();
-                let line = format!("{subj} --{rel}--> {}", self.engine.interner.display(&key[2]));
+                let line = format!(
+                    "{subj} --{rel}--> {}",
+                    self.engine.interner.display(&key[2])
+                );
                 if !crate::retrieval::tokens3(&line)
                     .iter()
                     .any(|t| t.len() >= 3 && qt.contains(t))
@@ -1040,16 +1095,16 @@ impl<X: Extractor> AgentMemory<X> {
                 if lines >= 8 {
                     break;
                 }
-                vals.sort_by(|a, b| b.0.cmp(&a.0));
-                let distinct: Vec<String> = vals
-                    .iter()
-                    .map(|(_, v)| v.clone())
-                    .fold(Vec::new(), |mut acc: Vec<String>, v| {
+                vals.sort_by_key(|v| Reverse(v.0));
+                let distinct: Vec<String> = vals.iter().map(|(_, v)| v.clone()).fold(
+                    Vec::new(),
+                    |mut acc: Vec<String>, v| {
                         if !acc.contains(&v) {
                             acc.push(v);
                         }
                         acc
-                    });
+                    },
+                );
                 if distinct.len() < 2 {
                     continue;
                 }
@@ -1086,9 +1141,13 @@ pub fn assemble_context(
         let v = engine.sym_of(name);
         relevant.extend(engine.query("current", &[Some(v), None, None]));
     }
-    relevant.sort_by(|a, b| b.1.conf.partial_cmp(&a.1.conf).unwrap_or(std::cmp::Ordering::Equal));
+    relevant.sort_by(|a, b| {
+        b.1.conf
+            .partial_cmp(&a.1.conf)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
-    let distilled_budget = (budget_tokens * 4 * 6 / 10).max(0);
+    let distilled_budget = budget_tokens * 4 * 6 / 10;
     let mut distilled = String::new();
     let mut used_prov: Vec<String> = Vec::new();
     for (k, ann) in &relevant {
@@ -1107,7 +1166,7 @@ pub fn assemble_context(
         used_prov.extend(ann.prov.iter().cloned());
     }
 
-    let source_budget = (budget_tokens * 4 * 4 / 10).max(0);
+    let source_budget = budget_tokens * 4 * 4 / 10;
     let mut sources = String::new();
     let mut used: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for ep in episodes {
@@ -1262,7 +1321,14 @@ impl<X: Extractor> AgentMemory<X> {
                 continue;
             }
             for row in &rel.rows {
-                let prov = row.fact.ann.prov.iter().cloned().collect::<Vec<_>>().join(",");
+                let prov = row
+                    .fact
+                    .ann
+                    .prov
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",");
                 let args = row
                     .key
                     .iter()
@@ -1285,10 +1351,7 @@ impl<X: Extractor> AgentMemory<X> {
     /// Load a snapshot into a fresh memory with the given extractor.
     /// Base facts are re-asserted with their annotations; derived
     /// relations are rebuilt by one maintenance run.
-    pub fn load(
-        extractor: X,
-        path: &str,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load(extractor: X, path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let text = std::fs::read_to_string(path)?;
         let mut lines = text.lines();
         let magic = lines.next();

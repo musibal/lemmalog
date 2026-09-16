@@ -13,10 +13,19 @@ fn synthetic_long_horizon_suite() {
     // bug the canonicalization tests exposed); this size keeps the
     // regression suite fast while exercising every behavior
     let rep = run_eval(42, 30, 8, 500, 40);
-    assert_eq!(rep.employment_correct, rep.employment_q, "knowledge updates");
+    assert_eq!(
+        rep.employment_correct, rep.employment_q,
+        "knowledge updates"
+    );
     assert!(rep.supersessions > 0, "scenario must exercise supersession");
-    assert_eq!(rep.multihop_correct, rep.multihop_q, "multi-hop reachability");
-    assert_eq!(rep.abstain_correct, rep.abstain_people, "conflict abstention");
+    assert_eq!(
+        rep.multihop_correct, rep.multihop_q,
+        "multi-hop reachability"
+    );
+    assert_eq!(
+        rep.abstain_correct, rep.abstain_people,
+        "conflict abstention"
+    );
     assert_eq!(rep.accuracy(), 1.0);
     assert!(
         rep.token_savings() > 3.0,

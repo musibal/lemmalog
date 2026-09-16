@@ -40,7 +40,10 @@ pub struct Instance {
 /// "2023/04/10 (Mon) 17:50" -> a monotonic minute-resolution integer.
 pub fn parse_date(s: &str) -> i64 {
     let parts: Vec<&str> = s.split_whitespace().collect();
-    let (d, t) = (parts.first().copied().unwrap_or("0/0/0"), parts.get(3).copied().unwrap_or("0:0"));
+    let (d, t) = (
+        parts.first().copied().unwrap_or("0/0/0"),
+        parts.get(3).copied().unwrap_or("0:0"),
+    );
     let dp: Vec<i64> = d.split('/').filter_map(|x| x.parse().ok()).collect();
     let tp: Vec<i64> = t.split(':').filter_map(|x| x.parse().ok()).collect();
     let (y, m, day) = (
@@ -62,20 +65,25 @@ pub fn load(path: &str) -> Result<Vec<Instance>, String> {
         let get = |k: &str| item[k].as_str().unwrap_or_default().to_string();
         let ids: Vec<String> = item["haystack_session_ids"]
             .as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
         let dates: Vec<String> = item["haystack_dates"]
             .as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
         let mut sessions = Vec::new();
         if let Some(arr) = item["haystack_sessions"].as_array() {
             for (idx, msgs) in arr.iter().enumerate() {
                 let id = ids.get(idx).cloned().unwrap_or_else(|| format!("s{idx}"));
-                let date = dates
-                    .get(idx)
-                    .cloned()
-                    .unwrap_or_default();
+                let date = dates.get(idx).cloned().unwrap_or_default();
                 let messages = msgs
                     .as_array()
                     .map(|a| {
@@ -114,14 +122,43 @@ pub fn score_f1(prediction: &str, gold: &str) -> (f64, bool) {
     let norm = |s: &str| -> Vec<String> {
         s.to_lowercase()
             .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| !t.is_empty() && !matches!(*t, "the" | "a" | "an" | "is" | "are" | "was" | "were" | "to" | "of" | "in" | "on" | "and" | "or" | "for" | "with" | "it" | "its"))
+            .filter(|t| {
+                !t.is_empty()
+                    && !matches!(
+                        *t,
+                        "the"
+                            | "a"
+                            | "an"
+                            | "is"
+                            | "are"
+                            | "was"
+                            | "were"
+                            | "to"
+                            | "of"
+                            | "in"
+                            | "on"
+                            | "and"
+                            | "or"
+                            | "for"
+                            | "with"
+                            | "it"
+                            | "its"
+                    )
+            })
             .map(|t| t.to_string())
             .collect()
     };
     let p = norm(prediction);
     let g = norm(gold);
     if p.is_empty() || g.is_empty() {
-        return (if p.is_empty() && g.is_empty() { 1.0 } else { 0.0 }, p == g);
+        return (
+            if p.is_empty() && g.is_empty() {
+                1.0
+            } else {
+                0.0
+            },
+            p == g,
+        );
     }
     let em = p == g;
     let mut common = std::collections::HashMap::new();
@@ -204,10 +241,17 @@ Episode:\n";
 /// order (symbol comparison in the engine is by intern id).
 pub fn date_to_int(s: &str) -> Option<i64> {
     let b = s.as_bytes();
-    let digits =
-        |r: std::ops::Range<usize>| b.get(r).map(|x| x.iter().all(|d| d.is_ascii_digit())).unwrap_or(false);
-    let (y, m, d) = if s.len() == 10 && b[4] == b'-' && b[7] == b'-'
-        && digits(0..4) && digits(5..7) && digits(8..10)
+    let digits = |r: std::ops::Range<usize>| {
+        b.get(r)
+            .map(|x| x.iter().all(|d| d.is_ascii_digit()))
+            .unwrap_or(false)
+    };
+    let (y, m, d) = if s.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && digits(0..4)
+        && digits(5..7)
+        && digits(8..10)
     {
         (&s[0..4], &s[5..7], &s[8..10])
     } else if s.len() == 7 && b[4] == b'-' && digits(0..4) && digits(5..7) {
@@ -264,11 +308,10 @@ fn seen_rels_count_off(m: &AgentMemory<Box<dyn crate::agent::Extractor>>) -> Vec
 /// the structured memory block (facts + dated edge history), and from the
 /// raw transcript alone (the paper's oracle baseline).
 fn chat_retry(chat: &OpenAiClient, system: &str, user: &str) -> Result<String, String> {
-    chat.chat(system, user)
-        .or_else(|e1| {
-            eprintln!("  api error ({e1}); retrying once...");
-            chat.chat(system, user)
-        })
+    chat.chat(system, user).or_else(|e1| {
+        eprintln!("  api error ({e1}); retrying once...");
+        chat.chat(system, user)
+    })
 }
 
 /// Whole-token subject matching for the dated-history append: a subject
@@ -277,8 +320,10 @@ fn chat_retry(chat: &OpenAiClient, system: &str, user: &str) -> Result<String, S
 /// "the"/"did") pulled in the whole edge table — 4-6x context bloat that
 /// drowned the very facts selection had chosen.
 pub fn subject_matches_question(subject: &str, question: &str) -> bool {
-    let qtokens: std::collections::BTreeSet<String> =
-        crate::retrieval::tokenize_pub(question).into_iter().filter(|t| t.len() >= 3).collect();
+    let qtokens: std::collections::BTreeSet<String> = crate::retrieval::tokenize_pub(question)
+        .into_iter()
+        .filter(|t| t.len() >= 3)
+        .collect();
     crate::retrieval::tokenize_pub(subject)
         .into_iter()
         .any(|t| t.len() >= 3 && qtokens.contains(&t))
@@ -339,9 +384,7 @@ pub fn run_instance(
     let mut order_rules = String::new();
     for r in &seen_rels_count_off(&m) {
         let safe = r.replace('/', "_");
-        order_rules.push_str(&format!(
-            "dated(S, D) :- current(S, \"{r}\", D).\n"
-        ));
+        order_rules.push_str(&format!("dated(S, D) :- current(S, \"{r}\", D).\n"));
         let _ = safe;
     }
     order_rules.push_str(
@@ -361,10 +404,9 @@ pub fn run_instance(
         .collect();
     let date_of = |v: &crate::intern::Value| -> String {
         match v.as_int() {
-            Some(ts) if ts > 0 && ts != i64::MAX => dates
-                .get(&ts)
-                .cloned()
-                .unwrap_or_else(|| ts.to_string()),
+            Some(ts) if ts > 0 && ts != i64::MAX => {
+                dates.get(&ts).cloned().unwrap_or_else(|| ts.to_string())
+            }
             _ => "open".to_string(),
         }
     };
@@ -458,10 +500,7 @@ answer, reply with the single word NONE.",
                 let mut recall_ctx = memory_ctx.clone();
                 recall_ctx.push_str("\nRECALLED FROM TRANSCRIPT:\n");
                 for f in &facts {
-                    recall_ctx.push_str(&format!(
-                        "{} --{}--> {}\n",
-                        f.subj, f.pred, f.obj
-                    ));
+                    recall_ctx.push_str(&format!("{} --{}--> {}\n", f.subj, f.pred, f.obj));
                 }
                 memory_pred = chat_retry(
                     chat,
@@ -475,7 +514,10 @@ answer, reply with the single word NONE.",
     let baseline_pred = chat_retry(
         chat,
         ANSWER_PROMPT,
-        &format!("CONTEXT (transcript):\n{transcript}\n\nQUESTION: {}", inst.question),
+        &format!(
+            "CONTEXT (transcript):\n{transcript}\n\nQUESTION: {}",
+            inst.question
+        ),
     )?;
 
     let (memory_f1, memory_em) = score_f1(&memory_pred, &inst.answer);

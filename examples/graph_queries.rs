@@ -6,7 +6,7 @@
 //!
 //! `cargo run --release --example graph_queries [nodes] [avg-degree]`
 
-use lemmalog::{Ann, Engine, Value};
+use lemmalog::{Ann, Engine};
 use std::time::Instant;
 
 struct Rng(u64);
@@ -50,11 +50,7 @@ fn main() {
         let a = node[(rng.next() as usize) % nodes];
         let b = node[(rng.next() as usize) % nodes];
         if a != b {
-            e.declare(
-                "arc",
-                &[a, b],
-                Ann::unit(),
-            );
+            e.declare("arc", &[a, b], Ann::unit());
         }
     }
     let ingest = t0.elapsed();
@@ -80,9 +76,7 @@ fn main() {
 
     println!("nodes={nodes} deg={deg} arcs={arcs}");
     println!("ingest          : {ingest:?}");
-    println!(
-        "fixpoint        : {eval:?} (+{derived} facts: {triangles} triangles, {reach} reach)"
-    );
+    println!("fixpoint        : {eval:?} (+{derived} facts: {triangles} triangles, {reach} reach)");
     println!("point query     : {point:?} (answer rows: {one})");
     println!("incremental turn: {inc_t:?} (+{inc} facts from one arc)");
 }

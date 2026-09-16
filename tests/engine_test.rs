@@ -30,10 +30,8 @@ fn transitive_closure() {
 #[test]
 fn temporal_projection_and_updates() {
     let mut e = Engine::new();
-    e.install_program(
-        "current(E,R,O) :- edge(E,R,O,VF,VT,_), now(T), VF =< T, T < VT.",
-    )
-    .unwrap();
+    e.install_program("current(E,R,O) :- edge(E,R,O,VF,VT,_), now(T), VF =< T, T < VT.")
+        .unwrap();
     edge(&mut e, "alice", "works_at", "acme", 0, i64::MAX, 1);
     e.set_now(10);
     e.run();
@@ -94,16 +92,33 @@ fn why_renders_proof_tree() {
     edge(&mut e, "b", "manager", "c", 0, i64::MAX, 1);
     // re-assert with provenance-bearing annotations
     let ab = syms(&mut e, &["a", "manager", "b"]);
-    let ab_args = [ab[0], ab[1], ab[2], Value::Int(0), Value::Int(i64::MAX), Value::Int(1)];
+    let ab_args = [
+        ab[0],
+        ab[1],
+        ab[2],
+        Value::Int(0),
+        Value::Int(i64::MAX),
+        Value::Int(1),
+    ];
     e.declare("edge", &ab_args, Ann::base(0.9, ["ep0"]));
     let bc = syms(&mut e, &["b", "manager", "c"]);
-    let bc_args = [bc[0], bc[1], bc[2], Value::Int(0), Value::Int(i64::MAX), Value::Int(1)];
+    let bc_args = [
+        bc[0],
+        bc[1],
+        bc[2],
+        Value::Int(0),
+        Value::Int(i64::MAX),
+        Value::Int(1),
+    ];
     e.declare("edge", &bc_args, Ann::base(0.9, ["ep1"]));
     e.run();
     let (a, c) = (e.sym("a"), e.sym("c"));
     let out = e.why("reports_to", &[a, c]);
     assert!(out.contains("via trans"), "proof tree: {out}");
-    assert!(out.contains("ep0") && out.contains("ep1"), "proof tree: {out}");
+    assert!(
+        out.contains("ep0") && out.contains("ep1"),
+        "proof tree: {out}"
+    );
     assert!(out.contains("asserted (base fact)"), "proof tree: {out}");
 }
 
@@ -242,7 +257,11 @@ fn scoped_recompute_on_retract() {
     assert_eq!(n, 0, "no net-new facts; two stale derivations dropped");
     assert_eq!(e.query("reports_to", &[]).len(), 1);
     assert_eq!(e.query("reports_to", &[]).len(), 1);
-    assert_eq!(e.query("unrelated", &[]).len(), 1, "unrelated survives recompute");
+    assert_eq!(
+        e.query("unrelated", &[]).len(),
+        1,
+        "unrelated survives recompute"
+    );
 }
 
 #[test]
@@ -256,8 +275,22 @@ fn ask_deep_matches_full_fixpoint() {
     let manager = e.sym("manager");
     for c in 0..10 {
         for i in 0..9 {
-            let (a, b) = (e.sym(&format!("c{c}n{i}")), e.sym(&format!("c{c}n{}", i+1)));
-            e.declare("edge", &[a, manager, b, Value::Int(0), Value::Int(i64::MAX), Value::Int(1)], Ann::unit());
+            let (a, b) = (
+                e.sym(&format!("c{c}n{i}")),
+                e.sym(&format!("c{c}n{}", i + 1)),
+            );
+            e.declare(
+                "edge",
+                &[
+                    a,
+                    manager,
+                    b,
+                    Value::Int(0),
+                    Value::Int(i64::MAX),
+                    Value::Int(1),
+                ],
+                Ann::unit(),
+            );
         }
     }
     e.run();
@@ -277,8 +310,22 @@ fn ask_deep_matches_full_fixpoint() {
     let manager2 = e2.sym("manager");
     for c in 0..10 {
         for i in 0..9 {
-            let (a, b) = (e2.sym(&format!("c{c}n{i}")), e2.sym(&format!("c{c}n{}", i+1)));
-            e2.declare("edge", &[a, manager2, b, Value::Int(0), Value::Int(i64::MAX), Value::Int(1)], Ann::unit());
+            let (a, b) = (
+                e2.sym(&format!("c{c}n{i}")),
+                e2.sym(&format!("c{c}n{}", i + 1)),
+            );
+            e2.declare(
+                "edge",
+                &[
+                    a,
+                    manager2,
+                    b,
+                    Value::Int(0),
+                    Value::Int(i64::MAX),
+                    Value::Int(1),
+                ],
+                Ann::unit(),
+            );
         }
     }
     let rows = e2.ask_deep("reports_to(\"c0n0\", Y)").unwrap();
@@ -427,7 +474,8 @@ fn change_feed_streams_adds_retractions_and_clears() {
     );
     // q's rebuild is a wholesale clear of q
     assert!(
-        feed.iter().any(|c| matches!(c, Change::Cleared(_, p) if p == "q")),
+        feed.iter()
+            .any(|c| matches!(c, Change::Cleared(_, p) if p == "q")),
         "{feed:?}"
     );
     assert_eq!(e.query("q", &[]).len(), 2, "q rebuilt without b");

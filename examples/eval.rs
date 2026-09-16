@@ -29,10 +29,7 @@ fn main() {
         "conflict abstention : {}/{} conflicted people keep ALL open preferences",
         rep.abstain_correct, rep.abstain_people
     );
-    println!(
-        "overall accuracy    : {:.1}%",
-        rep.accuracy() * 100.0
-    );
+    println!("overall accuracy    : {:.1}%", rep.accuracy() * 100.0);
     println!(
         "token economics     : {} ctx tokens vs {} transcript tokens ({:.1}x saving)",
         rep.context_tokens,

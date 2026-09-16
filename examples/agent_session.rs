@@ -15,7 +15,10 @@ fn main() {
     .unwrap();
 
     println!("== t=100: first session ==");
-    let r = m.observe_at("alice --manager--> bob\nbob --manager--> carol\nalice --works_at--> acme", 100);
+    let r = m.observe_at(
+        "alice --manager--> bob\nbob --manager--> carol\nalice --works_at--> acme",
+        100,
+    );
     println!("added={}, escalations={}", r.added, r.escalations.len());
     println!("maintain derived {} facts", m.maintain(100));
 
@@ -23,7 +26,10 @@ fn main() {
     let r = m.observe_at("alice --works_at--> gigant", 200);
     println!("updated={}, escalations={}", r.updated, r.escalations.len());
     println!("maintain re-derived {} facts", m.maintain(200));
-    println!("ask current(alice, works_at, O) -> {:?}", m.ask("current(\"alice\", \"works_at\", O)").unwrap());
+    println!(
+        "ask current(alice, works_at, O) -> {:?}",
+        m.ask("current(\"alice\", \"works_at\", O)").unwrap()
+    );
 
     println!("\n== t=300: ambiguous conflict escalates ==");
     let r = m.observe_at("alice --likes--> bob\nalice --likes--> carol", 300);
@@ -42,21 +48,37 @@ fn main() {
     }
 
     println!("\n== lookahead: what would follow if carol joined under alice? ==");
-    let (rows, added) = m.what_if("carol --manager--> alice", "reports_to(\"carol\", Y)").unwrap();
+    let (rows, added) = m
+        .what_if("carol --manager--> alice", "reports_to(\"carol\", Y)")
+        .unwrap();
     println!("hypothetical reports_to(carol, Y) => {rows:?} (would add {added} facts)");
     assert!(m.ask("reports_to(\"carol\", Y)").unwrap().is_empty());
-    println!("(store untouched: carol still unknown: {:?})", m.ask("reports_to(\"carol\", Y)").unwrap());
+    println!(
+        "(store untouched: carol still unknown: {:?})",
+        m.ask("reports_to(\"carol\", Y)").unwrap()
+    );
 
     println!("\n== agent installs its own rule batch (versioned, revertable) ==");
-    let batch = m.install_rules("skip(X,Z) :- reports_to(X,Y), reports_to(Y,Z).").unwrap();
+    let batch = m
+        .install_rules("skip(X,Z) :- reports_to(X,Y), reports_to(Y,Z).")
+        .unwrap();
     let _ = m.maintain(300);
-    println!("installed batch {batch}: skip-level pairs = {}", m.ask("skip(X, Y)").unwrap().len());
+    println!(
+        "installed batch {batch}: skip-level pairs = {}",
+        m.ask("skip(X, Y)").unwrap().len()
+    );
     m.uninstall_rules(&batch);
     let _ = m.maintain(300);
-    println!("after uninstall: skip-level pairs = {}", m.ask("skip(X, Y)").unwrap().len());
+    println!(
+        "after uninstall: skip-level pairs = {}",
+        m.ask("skip(X, Y)").unwrap().len()
+    );
 
     println!("\n== demand-driven query (magic sets; store untouched) ==");
-    println!("?- reports_to(\"alice\", Y) deep ==> {:?}", m.ask_deep("reports_to(\"alice\", Y)").unwrap());
+    println!(
+        "?- reports_to(\"alice\", Y) deep ==> {:?}",
+        m.ask_deep("reports_to(\"alice\", Y)").unwrap()
+    );
 
     println!("\n== assembled context for a query about alice ==");
     println!("{}", m.context(&["alice"], 120));

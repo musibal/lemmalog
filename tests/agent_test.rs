@@ -26,7 +26,10 @@ fn reobservation_is_noop() {
     assert_eq!(r.noop, 1);
     assert_eq!(r.added, 0);
     m.maintain(100);
-    assert_eq!(m.ask("current(\"alice\", \"works_at\", O)").unwrap().len(), 1);
+    assert_eq!(
+        m.ask("current(\"alice\", \"works_at\", O)").unwrap().len(),
+        1
+    );
 }
 
 #[test]
@@ -48,9 +51,17 @@ fn exclusive_pred_supersedes_deterministically() {
         "knowledge update applied"
     );
     // the old edge is closed, not deleted: history preserved
-    let closed = m
-        .engine
-        .query("edge", &[None, None, None, None, Some(lemmalog::Value::Int(200)), None]);
+    let closed = m.engine.query(
+        "edge",
+        &[
+            None,
+            None,
+            None,
+            None,
+            Some(lemmalog::Value::Int(200)),
+            None,
+        ],
+    );
     assert_eq!(closed.len(), 1, "exactly one edge closed at t=200");
 }
 
@@ -123,10 +134,8 @@ fn context_assembly_is_positional_and_budgeted() {
 
 #[test]
 fn derivation_rules_compose_with_ingestion() {
-    let mut m = mem(
-        "reports_to(X,Y) :- current(X,\"manager\",Y).\n\
-         trans: reports_to(X,Z) :- reports_to(X,Y), reports_to(Y,Z).",
-    );
+    let mut m = mem("reports_to(X,Y) :- current(X,\"manager\",Y).\n\
+         trans: reports_to(X,Z) :- reports_to(X,Y), reports_to(Y,Z).");
     m.observe("alice --manager--> bob\nbob --manager--> carol");
     let derived = m.maintain(100);
     assert_eq!(derived, 5, "2 current + 2 direct + 1 transitive");
@@ -177,16 +186,30 @@ fn llm_extractor_pluggable_and_memoized() {
     // per-fact confidence honored by the protocol
     let emp = m.ask("current(\"alice\", \"works_at\", O)").unwrap();
     assert_eq!(emp, vec!["O=acme".to_string()]);
-    let (a, wa, ac) = (m.engine.sym("alice"), m.engine.sym("works_at"), m.engine.sym("acme"));
-    let f = m.engine.fact("edge", &[a, wa, ac, Value::Int(100), Value::Int(i64::MAX), Value::Int(100)]).unwrap();
+    let (a, wa, ac) = (
+        m.engine.sym("alice"),
+        m.engine.sym("works_at"),
+        m.engine.sym("acme"),
+    );
+    let f = m
+        .engine
+        .fact(
+            "edge",
+            &[
+                a,
+                wa,
+                ac,
+                Value::Int(100),
+                Value::Int(i64::MAX),
+                Value::Int(100),
+            ],
+        )
+        .unwrap();
     assert!((f.ann.conf - 0.7).abs() < 1e-9, "conf = {}", f.ann.conf);
     // extraction errors degrade to zero facts, not poison
     // (checked via a second memory below)
-    let mut m2 = AgentMemory::new(
-        LlmExtractor::new(|_| Err("provider down".to_string())),
-        "",
-    )
-    .unwrap();
+    let mut m2 =
+        AgentMemory::new(LlmExtractor::new(|_| Err("provider down".to_string())), "").unwrap();
     let r2 = m2.observe("whatever");
     assert_eq!(r2.added, 0);
 }
@@ -232,7 +255,10 @@ fn snapshot_roundtrip_rebuilds_derived_relations() {
             None => s.to_string(),
         }
     };
-    assert_eq!(strip_news(&m2.context(&["alice"], 300)), strip_news(&before_ctx));
+    assert_eq!(
+        strip_news(&m2.context(&["alice"], 300)),
+        strip_news(&before_ctx)
+    );
     // why() still walks to the re-asserted base facts
     let w = m2.why("current(alice, works_at, gigant)");
     assert!(w.contains("asserted (base fact)"), "{w}");
@@ -301,7 +327,9 @@ fn parse_protocol_reported_gives_drop_reasons() {
         "{reasons:?}"
     );
     assert!(
-        reasons.iter().any(|r| r.contains("prose") || r.contains("punctuation")),
+        reasons
+            .iter()
+            .any(|r| r.contains("prose") || r.contains("punctuation")),
         "{reasons:?}"
     );
     assert!(
@@ -313,10 +341,8 @@ fn parse_protocol_reported_gives_drop_reasons() {
 #[test]
 fn observe_extracted_applies_policy_and_reports_drops() {
     let mut m = mem("");
-    let (report, dropped) = m.observe_extracted(
-        "alice --works_at--> acme\nspeaker --works_at--> acme",
-        100,
-    );
+    let (report, dropped) =
+        m.observe_extracted("alice --works_at--> acme\nspeaker --works_at--> acme", 100);
     assert_eq!(report.added, 1, "only the clean fact asserted");
     assert_eq!(dropped.len(), 1);
     assert!(dropped[0].1.contains("role word"));
@@ -327,6 +353,48 @@ fn observe_extracted_applies_policy_and_reports_drops() {
     );
 }
 
+/// Regression: moving the clock does not refresh temporal views on its own.
+///
+/// Seminaive evaluation fires a rule only for facts in the epoch delta, so a
+/// `now(T)` view like `current/3` keeps answering as of the clock that was
+/// set when each edge arrived. Production hit this from the other side: a
+/// backdated batch rewound the clock, and every fact whose VF was later
+/// silently stopped projecting — still in `edge`, absent from `current`, and
+/// no amount of re-running maintenance brought it back. `invalidate_derived`
+/// is the documented escape hatch, and the MCP read paths call it via
+/// `sync_clock`.
+#[test]
+fn seminaive_does_not_refresh_now_rules_without_invalidation() {
+    let mut m = mem("");
+    // valid from t=2000, but derived while the clock sits at 1000
+    m.observe_extracted("late --relates_to--> ticket", 2000);
+    m.maintain(1000);
+    assert!(
+        m.ask("current(\"late\", R, O)").unwrap().is_empty(),
+        "VF=2000 must not project at clock 1000"
+    );
+    // the edge is resident either way
+    assert_eq!(m.ask("edge(\"late\", R, O, VF, VT, TS)").unwrap().len(), 1);
+
+    // Pins current design, not a requirement: advancing the clock alone
+    // leaves the view stale because there is no delta to fire on. If
+    // `set_now` ever learns to invalidate when clock-dependent rules exist,
+    // delete this assertion — the two around it are the regression guard.
+    m.maintain(3000);
+    assert!(
+        m.ask("current(\"late\", R, O)").unwrap().is_empty(),
+        "clock advance alone does not refresh — this is why invalidate_derived exists"
+    );
+
+    // invalidation re-seeds the delta and the view catches up
+    m.engine.invalidate_derived();
+    m.maintain(3000);
+    assert_eq!(
+        m.ask("current(\"late\", R, O)").unwrap().len(),
+        1,
+        "after invalidation the fact projects at clock 3000"
+    );
+}
 #[test]
 fn source_references_are_valid_entities() {
     use lemmalog::agent::parse_protocol_reported;
@@ -400,10 +468,16 @@ fn batch_ids_never_collide_across_uninstall() {
     // with ids derived from rule_batches.len() the new batch would reuse
     // b2 while the original b2 is still live, and uninstall("b2") would
     // then target whichever batch position() finds first
-    let b1 = m.install_rules("r1(X, Y) :- current(X, \"knows\", Y).").unwrap();
-    let b2 = m.install_rules("r2(X, Y) :- current(X, \"likes\", Y).").unwrap();
+    let b1 = m
+        .install_rules("r1(X, Y) :- current(X, \"knows\", Y).")
+        .unwrap();
+    let b2 = m
+        .install_rules("r2(X, Y) :- current(X, \"likes\", Y).")
+        .unwrap();
     assert!(m.uninstall_rules(&b1));
-    let b3 = m.install_rules("r3(X, Y) :- current(X, \"owns\", Y).").unwrap();
+    let b3 = m
+        .install_rules("r3(X, Y) :- current(X, \"owns\", Y).")
+        .unwrap();
     assert_ne!(b2, b3, "new batch id must not collide with a live batch");
     // uninstall by id after the churn removes exactly the batch asked for
     assert!(m.uninstall_rules(&b2));
@@ -525,7 +599,10 @@ fn rich_context_carries_attribution_and_latest_values() {
     m.maintain(200);
     let ctx = m.context_for_query_rich("What was grandma's gift to Melanie?", 400);
     assert!(ctx.contains("ATTRIBUTION"), "{ctx}");
-    assert!(ctx.to_lowercase().contains("no topic facts for: melanie"), "{ctx}");
+    assert!(
+        ctx.to_lowercase().contains("no topic facts for: melanie"),
+        "{ctx}"
+    );
     let ctx2 = m.context_for_query_rich("What is the latest amount Melanie charges?", 400);
     assert!(ctx2.contains("CURRENT STATE"), "{ctx2}");
     assert!(
@@ -544,7 +621,7 @@ fn kernel_code_facts_surive_strict_validation() {
                  entry --links--> entry->links\n\
                  vm_map --lookup--> vm_map_lookup_entry()\n\
                  page --addr_flags--> &vm_page[0]";
-    let m = AgentMemory::<MockExtractor>::new(MockExtractor::new(0.9), "").unwrap();
+    let _m = AgentMemory::<MockExtractor>::new(MockExtractor::new(0.9), "").unwrap();
     let parsed = lemmalog::agent::parse_protocol_strict(facts, 0.9);
     assert_eq!(parsed.len(), 6, "all C-syntax facts parse: {parsed:?}");
     // leaked deliberation still dies: spaces + punctuation
@@ -582,7 +659,10 @@ fn functional_relations_supersede_and_multi_accumulate_silently() {
     );
     assert_eq!(r2.escalations.len(), 0, "evidence adds silently");
     m.maintain(300);
-    assert_eq!(m.ask("current(\"hyp_1\", \"evidence\", E)").unwrap().len(), 2);
+    assert_eq!(
+        m.ask("current(\"hyp_1\", \"evidence\", E)").unwrap().len(),
+        2
+    );
 }
 
 #[test]
@@ -653,7 +733,7 @@ fn snapshot_omits_aggregate_scratch_relations() {
         "aggregate scratch leaked into the snapshot"
     );
 
-    let mut m2 = AgentMemory::load(MockExtractor::new(0.9), path).unwrap();
+    let m2 = AgentMemory::load(MockExtractor::new(0.9), path).unwrap();
     assert_eq!(
         m2.ask("evidence_count(\"hyp_1\", N)").unwrap(),
         before,
@@ -759,4 +839,38 @@ fn load_folds_a_per_value_queue_into_one_line_per_slot() {
         "el remedio viaja con la linea: {kept}"
     );
     assert!(!kept.contains("ep1, but"), "la vieja se pliega, no se copia: {kept}");
+}
+
+#[test]
+fn underscore_prefixed_variables_parse_as_variables() {
+    // issue #6: `_Y` (Prolog named don't-care) parsed as a constant, so
+    // rules using it silently derived nothing; `_foo` stays a constant
+    let mut m = AgentMemory::<MockExtractor>::new(MockExtractor::new(0.9), "").unwrap();
+    m.observe_extracted("n0 --requires--> m0\nn1 --requires--> m1", 100);
+    m.maintain(100);
+    m.install_rules("interior(X) :- current(X, \"requires\", _Y).").unwrap();
+    m.maintain(100);
+    assert_eq!(m.ask("interior(X)").unwrap().len(), 2, "_Y is a variable");
+    m.install_rules("tagged(X) :- current(X, \"requires\", _foo).").unwrap();
+    m.maintain(100);
+    // `_foo` is a constant that matches nothing: still derives nothing
+    assert_eq!(m.ask("tagged(X)").unwrap().len(), 0, "_foo stays a constant");
+}
+
+#[test]
+fn installing_a_shadow_rule_warns_about_union() {
+    // issue #7: installing a "corrected" rule without uninstalling the old
+    // one keeps both active (union); the response must say so
+    let mut m = AgentMemory::<MockExtractor>::new(MockExtractor::new(0.9), "").unwrap();
+    m.observe_extracted("n0 --requires--> m0", 100);
+    m.maintain(100);
+    let b1 = m.install_rules("dep(A, B) :- current(A, \"requires\", B).").unwrap();
+    assert!(m.batch_conflicts(&b1).is_empty(), "first install is clean");
+    let b2 = m
+        .install_rules("dep(A, B) :- current(A, \"requires\", B), current(A, \"keep\", yes).")
+        .unwrap();
+    let warns = m.batch_conflicts(&b2);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].contains("dep is also defined by batch(es) b"), "{warns:?}");
+    assert!(warns[0].contains("UNION"), "{warns:?}");
 }

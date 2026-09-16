@@ -54,8 +54,8 @@ impl OpenAiClient {
         let base = base_url.trim_end_matches('/').to_string();
         let url = base.clone();
         let api_key = std::env::var("LEMMALOG_API_KEY")
-                .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-                .ok();
+            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+            .ok();
         OpenAiClient {
             base_url: base,
             model: model.to_string(),
@@ -78,9 +78,7 @@ impl OpenAiClient {
                 }
                 let first = req.clone();
                 match first.send_string(body) {
-                    Ok(resp) => resp
-                        .into_string()
-                        .map_err(|e| format!("read: {e}")),
+                    Ok(resp) => resp.into_string().map_err(|e| format!("read: {e}")),
                     Err(ureq::Error::Status(429, resp)) => {
                         // rate limited: back off, then one retry on the
                         // saved request
@@ -141,11 +139,7 @@ impl OpenAiClient {
             .as_str()
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string())
-            .or_else(|| {
-                msg["reasoning_content"]
-                    .as_str()
-                    .map(|s| s.to_string())
-            })
+            .or_else(|| msg["reasoning_content"].as_str().map(|s| s.to_string()))
             .ok_or_else(|| format!("no content in response: {resp}"))?;
         Ok(strip_think(&content))
     }
@@ -251,12 +245,7 @@ impl Extractor for FileCachedExtractor {
         let _ = std::fs::create_dir_all(&self.dir);
         let body: String = facts
             .iter()
-            .map(|f| {
-                format!(
-                    "{} --{}[{}]--> {}\n",
-                    f.subj, f.pred, f.confidence, f.obj
-                )
-            })
+            .map(|f| format!("{} --{}[{}]--> {}\n", f.subj, f.pred, f.confidence, f.obj))
             .collect();
         let _ = std::fs::write(&path, body);
         facts
@@ -282,7 +271,8 @@ fn chunk_episode(text: &str, target: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut cur = String::new();
     for line in text.lines() {
-        let starts_msg = line.starts_with("user:") || line.starts_with("assistant:")
+        let starts_msg = line.starts_with("user:")
+            || line.starts_with("assistant:")
             || line.starts_with("Session ");
         if starts_msg && !cur.is_empty() && cur.len() + line.len() > target {
             chunks.push(std::mem::take(&mut cur));
@@ -384,8 +374,7 @@ impl Embedder for HttpEmbedder {
             return v.clone();
         }
         self.calls.set(self.calls.get() + 1);
-        let v = OpenAiClient::http_embed(&self.base_url, &self.model, text)
-            .unwrap_or_default();
+        let v = OpenAiClient::http_embed(&self.base_url, &self.model, text).unwrap_or_default();
         self.cache.borrow_mut().insert(text.to_string(), v.clone());
         v
     }
@@ -408,9 +397,7 @@ Known predicates and sample facts follow.\n";
 /// by a positive body atom), and the whole set must stratify. Returns the
 /// clause text lines worth installing — invalid lines are reported, not
 /// silently dropped.
-pub fn parse_rule_candidates(
-    text: &str,
-) -> Result<Vec<String>, String> {
+pub fn parse_rule_candidates(text: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for line in text.lines() {
         let line = line.trim().trim_matches('`');

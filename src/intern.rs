@@ -62,7 +62,7 @@ impl Interner {
 /// Aggregate functions usable in rule HEAD arguments only
 /// (`kit_count(P, count(K))`). Lowered internally to a temp relation plus
 /// a group-by fold; the head predicate completes before any reader.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AggFn {
     Count,
     Min,
@@ -82,7 +82,7 @@ impl AggFn {
 }
 
 /// A term appearing in rules: a variable, a constant symbol, or an integer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum Term {
     Var(String),
     Sym(String),

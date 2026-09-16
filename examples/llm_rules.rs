@@ -62,12 +62,10 @@ Write rule(s) defining org_member(Person, Org).";
     let program = lines.join("\n");
     println!("\nvalidated rules:\n{program}");
 
-    let batch = m
-        .install_rules(&program)
-        .unwrap_or_else(|e| {
-            eprintln!("install rejected: {e}");
-            std::process::exit(1);
-        });
+    let batch = m.install_rules(&program).unwrap_or_else(|e| {
+        eprintln!("install rejected: {e}");
+        std::process::exit(1);
+    });
     println!("installed batch {batch}");
     let derived = m.maintain(100);
     println!("backfill derived {derived} facts");
@@ -113,7 +111,11 @@ Write rule(s) defining org_member(Person, Org).";
 
     println!(
         "\n== {} | wall {:.0}s ==",
-        if pass { "RULE AUTHORING PASS" } else { "RULE AUTHORING FAIL" },
+        if pass {
+            "RULE AUTHORING PASS"
+        } else {
+            "RULE AUTHORING FAIL"
+        },
         t0.elapsed().as_secs_f64()
     );
 }

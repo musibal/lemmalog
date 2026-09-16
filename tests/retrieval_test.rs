@@ -12,13 +12,15 @@ fn bm25_ranks_relevant_documents_first() {
         "best pancake recipe with buttermilk".into(),
         "battery replacement for the GPS system".into(),
         "sourdough starter maintenance".into(),
-    ]
-    .into();
+    ];
     let bm25 = Bm25::new(&docs);
     let scores = bm25.scores("car battery replacement");
     assert!(scores[0] > scores[1], "car doc beats pancake doc");
     assert!(scores[2] > scores[3], "battery doc beats sourdough doc");
-    assert!(scores[1] == 0.0 && scores[3] == 0.0, "irrelevant docs score 0");
+    assert!(
+        scores[1] == 0.0 && scores[3] == 0.0,
+        "irrelevant docs score 0"
+    );
 }
 
 #[test]
@@ -101,14 +103,14 @@ fn context_for_query_end_to_end() {
     assert!(ctx.contains("manager"), "{ctx}");
     // entity-boosted facts rank first: alice's facts above carol's (which
     // only weakly matches via the stemmed "work" -> "works_at" token)
-    let facts_section = ctx
-        .split("== source episodes")
-        .next()
-        .unwrap_or("");
+    let facts_section = ctx.split("== source episodes").next().unwrap_or("");
     let first_alice = facts_section.find("alice").unwrap();
     let first_carol = facts_section.find("carol");
     if let Some(c) = first_carol {
-        assert!(first_alice < c, "alice facts rank above carol's: {facts_section}");
+        assert!(
+            first_alice < c,
+            "alice facts rank above carol's: {facts_section}"
+        );
     }
 }
 
@@ -142,7 +144,10 @@ fn semantic_rerank_surfaces_lexical_gaps() {
     let r = Retrieval::build(&m.engine, m.episodes());
     let plain = r.select("kitchen gadget", 600);
     assert!(
-        !plain.fact_lines.iter().any(|(l, _)| l.contains("instant_pot")),
+        !plain
+            .fact_lines
+            .iter()
+            .any(|(l, _)| l.contains("instant_pot")),
         "baseline: BM25 finds nothing: {:?}",
         plain.fact_lines
     );
@@ -160,7 +165,9 @@ fn semantic_rerank_surfaces_lexical_gaps() {
         .collect();
     let sel = r.select_semantic("kitchen gadget", 600, &fact_embeds, &[0.95, 0.05]);
     assert!(
-        sel.fact_lines.iter().any(|(l, _)| l.contains("instant_pot")),
+        sel.fact_lines
+            .iter()
+            .any(|(l, _)| l.contains("instant_pot")),
         "semantic fusion surfaces the instant pot: {:?}",
         sel.fact_lines
     );

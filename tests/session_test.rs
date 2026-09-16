@@ -28,7 +28,9 @@ fn repl_session_end_to_end() {
     assert!(s.execute("rm b2").contains("uninstalled b2"));
     s.execute("run");
     // trans rule gone: only the two direct facts remain
-    assert!(s.execute("? reports_to(\"alice\", \"carol\")").contains("(no answers)"));
+    assert!(s
+        .execute("? reports_to(\"alice\", \"carol\")")
+        .contains("(no answers)"));
     assert!(!s.execute("? reports_to(\"alice\", \"bob\")").is_empty());
     assert!(s.execute("rm b1").contains("uninstalled b1"));
     s.execute("run");

@@ -4,7 +4,7 @@
 //! Commands:
 //! - `rule <clause>`    install one rule or fact clause (rule program)
 //! - `+ <fact> [@conf] [#prov]`  assert a base fact, e.g.
-//!                               `+ edge(alice, works_at, acme, 0, MAX, 1) @0.9 #ep1`
+//!   `+ edge(alice, works_at, acme, 0, MAX, 1) @0.9 #ep1`
 //! - `? <goal>`         query materialized relations (index-backed `ask`)
 //! - `?? <goal>`        demand-driven query (magic sets)
 //! - `why <fact>`       provenance proof tree
@@ -56,7 +56,11 @@ impl Session {
             "?" => self.query(rest, false),
             "??" => self.query(rest, true),
             "why" => self.why(rest),
-            "run" => Ok(format!("+{} facts (epoch {})\n", self.engine.run(), self.engine.epoch())),
+            "run" => Ok(format!(
+                "+{} facts (epoch {})\n",
+                self.engine.run(),
+                self.engine.epoch()
+            )),
             "now" => match rest.parse::<i64>() {
                 Ok(t) => {
                     self.engine.set_now(t);

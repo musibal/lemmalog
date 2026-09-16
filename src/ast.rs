@@ -18,15 +18,18 @@
 //! `!` is negation-as-absence, restricted by the engine to strictly lower
 //! strata. Variables start with uppercase.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use crate::intern::{AggFn, Term};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct Atom {
     pub pred: String,
     pub args: Vec<Term>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CmpOp {
     Lt,
     Le,
@@ -38,14 +41,14 @@ pub enum CmpOp {
 
 /// Additive integer expression on the right-hand side of a comparison:
 /// `term (+|- term)*`. Symbols are not arithmetic.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum Expr {
     T(Term),
     Add(Box<Expr>, Box<Expr>),
     Sub(Box<Expr>, Box<Expr>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum Lit {
     Pos(Atom),
     Neg(Atom),
@@ -53,13 +56,44 @@ pub enum Lit {
     Now(Term),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct Clause {
     pub name: Option<String>,
     pub head: Atom,
     pub body: Vec<Lit>,
     /// None => EDB fact assertion inside a program.
     pub is_fact: bool,
+}
+
+/// What makes two clause firings the same rule.
+///
+/// Derived from the clause's own content - its name, its head, and its body
+/// including the polarity of every literal - so it is stable across reinstalls
+/// and across a `uninstall` that renumbers the clause vector, and so two
+/// clauses that differ only in which predicate they negate are different
+/// rules. Two textually identical clauses installed twice are the same rule
+/// and share an id, which is the intended reading: it is one rule, asserted
+/// twice.
+///
+/// The value is a hash, so it is an identity and not a name: it is never
+/// rendered, never persisted, and never compared across processes. Nothing in
+/// this crate stores one, and `std`'s default hasher is explicitly not stable
+/// across releases, so nothing may start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClauseId(pub u64);
+
+impl Clause {
+    /// This clause's content identity.
+    ///
+    /// Recomputed per call rather than cached: `emit_head` already clones the
+    /// clause name and formats a label on the same path, so hashing a handful
+    /// of short strings beside that is not what this loop costs.
+    pub fn id(&self) -> ClauseId {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+
+        ClauseId(hasher.finish())
+    }
 }
 
 #[derive(Debug)]
@@ -117,7 +151,8 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, ParseError> {
             }
             let s: String = b[start..i].iter().collect();
             toks.push(Tok::Int(
-                s.parse().map_err(|_| ParseError(format!("bad integer {s}")))?,
+                s.parse()
+                    .map_err(|_| ParseError(format!("bad integer {s}")))?,
             ));
         } else if c.is_alphabetic() || c == '_' {
             let start = i;
@@ -326,7 +361,14 @@ impl Parser {
                     .next()
                     .map(|c| c.is_ascii_uppercase())
                     .unwrap_or(false)
+                    || (s.starts_with('_')
+                        && s.chars().nth(1).map(|c| c.is_ascii_uppercase()).unwrap_or(false))
                 {
+                    // `_Y` is the Prolog named-don't-care convention: a
+                    // variable, not a constant — parsing it as a symbol
+                    // made every rule using one silently derive nothing.
+                    // `_foo` (lowercase after the underscore) stays a
+                    // constant.
                     Ok(Term::Var(s))
                 }
                 // aggregate terms: count(X) / min(X) / max(X) / sum(X)
@@ -359,4 +401,3 @@ impl Parser {
         }
     }
 }
-

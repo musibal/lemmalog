@@ -29,7 +29,14 @@ fn main() {
     for i in 0..n - 1 {
         e.declare(
             "edge",
-            &[names[i], manager, names[i + 1], Value::Int(0), Value::Int(i64::MAX), Value::Int(1)],
+            &[
+                names[i],
+                manager,
+                names[i + 1],
+                Value::Int(0),
+                Value::Int(i64::MAX),
+                Value::Int(1),
+            ],
             Ann::unit(),
         );
     }
@@ -45,7 +52,14 @@ fn main() {
     let extra = e.sym("n_extra");
     e.declare(
         "edge",
-        &[names[n - 1], manager, extra, Value::Int(0), Value::Int(i64::MAX), Value::Int(2)],
+        &[
+            names[n - 1],
+            manager,
+            extra,
+            Value::Int(0),
+            Value::Int(i64::MAX),
+            Value::Int(2),
+        ],
         Ann::unit(),
     );
     let t2 = Instant::now();

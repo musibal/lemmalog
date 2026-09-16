@@ -47,7 +47,10 @@ fn main() {
             .filter(|s| !s.is_empty())
             .collect();
         for inst in &instances {
-            if needles.iter().any(|n| inst.question.to_lowercase().contains(n)) {
+            if needles
+                .iter()
+                .any(|n| inst.question.to_lowercase().contains(n))
+            {
                 selection.push(inst);
             }
         }
@@ -92,7 +95,9 @@ fn main() {
                         0.0
                     }
                 );
-                let e = per_type.entry(r.question_type.clone()).or_insert((0, 0.0, 0.0, 0, 0, 0, 0));
+                let e = per_type
+                    .entry(r.question_type.clone())
+                    .or_insert((0, 0.0, 0.0, 0, 0, 0, 0));
                 e.0 += 1;
                 e.1 += r.memory_f1;
                 e.2 += r.baseline_f1;
@@ -102,9 +107,19 @@ fn main() {
                 e.6 += r.transcript_tokens;
             }
             Err(e) if e == "__no_answer__" => {
-                println!("\n[{}/{}] {} (context assembled, answers skipped)", i + 1, selection.len(), inst.question_type);
+                println!(
+                    "\n[{}/{}] {} (context assembled, answers skipped)",
+                    i + 1,
+                    selection.len(),
+                    inst.question_type
+                );
             }
-            Err(e) => println!("\n[{}/{}] {} FAILED: {e}", i + 1, selection.len(), inst.question_type),
+            Err(e) => println!(
+                "\n[{}/{}] {} FAILED: {e}",
+                i + 1,
+                selection.len(),
+                inst.question_type
+            ),
         }
     }
 

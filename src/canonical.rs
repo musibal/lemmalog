@@ -131,8 +131,8 @@ pub fn alias_conflicts(e: &Engine) -> Vec<String> {
 #[cfg(feature = "llm")]
 pub mod reconcile {
     use super::*;
-    use crate::llm::OpenAiClient;
     use crate::llm::HttpEmbedder;
+    use crate::llm::OpenAiClient;
     use crate::semantics::Embedder;
 
     pub const RECONCILE_PROMPT: &str = "\

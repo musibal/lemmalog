@@ -43,9 +43,9 @@ fn load(path: &str) -> AgentMemory<MockExtractor> {
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|a| a == name).and_then(|i| {
-        args.get(i + 1).cloned().filter(|v| !v.starts_with("--"))
-    })
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1).cloned().filter(|v| !v.starts_with("--")))
 }
 
 /// Payload for a MUTATING command. Empty is always a mistake — `rules` with no
@@ -80,11 +80,24 @@ fn main() {
             let ts = flag(&args, "--ts").and_then(|t| t.parse::<i64>().ok());
             let ts = m.ts_or_wall_clock(ts);
             let (report, dropped) = m.observe_extracted(&text, ts);
-            let _ = m.maintain(m.engine.now);
+            // `--ts` is the facts' valid-time only (VF). The clock this
+            // snapshot persists must stay the reader's present: a backdated
+            // observe used to rewind `NOW`, and the next reader of the same
+            // file derived `current/3` as of that past — the same bug the MCP
+            // transport fixed. `ts_or_wall_clock(None)` is the present, and
+            // never backwards.
+            let now = m.ts_or_wall_clock(None);
+            if now > m.engine.now {
+                m.engine.invalidate_derived();
+            }
+            let _ = m.maintain(now);
             m.save(&snap_path()).expect("save snapshot");
             println!(
                 "added={} updated={} noop={} escalations={}",
-                report.added, report.updated, report.noop, report.escalations.len()
+                report.added,
+                report.updated,
+                report.noop,
+                report.escalations.len()
             );
             for d in dropped.iter().take(5) {
                 println!("dropped: {} ({})", d.0, d.1);
@@ -141,6 +154,9 @@ fn main() {
                     let n = m.maintain(m.engine.now);
                     m.save(&snap_path()).expect("save snapshot");
                     println!("installed {id}; backfill derived +{n} facts");
+                    for w in m.batch_conflicts(&id) {
+                        println!("WARNING: {w}");
+                    }
                 }
                 Err(e) => {
                     eprintln!("install: {e}");

@@ -88,7 +88,10 @@ impl Scenario {
             }
             _ => {
                 // filler small talk: extraction should skip it
-                lines.push(format!("p{} checked in at t{ts}", self.rng.below(self.people.len())));
+                lines.push(format!(
+                    "p{} checked in at t{ts}",
+                    self.rng.below(self.people.len())
+                ));
             }
         }
         let text = lines.join("\n");
@@ -141,7 +144,10 @@ impl Scenario {
             if a == b {
                 continue;
             }
-            let dup = pos.iter().chain(neg.iter()).any(|((x, y), _)| x == &a && y == &b);
+            let dup = pos
+                .iter()
+                .chain(neg.iter())
+                .any(|((x, y), _)| x == &a && y == &b);
             if dup {
                 continue;
             }
@@ -216,7 +222,13 @@ impl EvalReport {
 
 /// Run a full synthetic evaluation: stream the scenario through an
 /// `AgentMemory`, then score against ground truth.
-pub fn run_eval(seed: u64, people: usize, orgs: usize, turns: usize, multihop_q: usize) -> EvalReport {
+pub fn run_eval(
+    seed: u64,
+    people: usize,
+    orgs: usize,
+    turns: usize,
+    multihop_q: usize,
+) -> EvalReport {
     let mut sc = Scenario::new(seed, people, orgs);
     let mut m = AgentMemory::new(
         MockExtractor::new(0.9),

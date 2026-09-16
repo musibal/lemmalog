@@ -90,7 +90,10 @@ pub fn build(
                     pred: adorn_name(&pred, &adornment),
                     args: args.clone(),
                 },
-                body: vec![Lit::Pos(crate::ast::Atom { pred: pred.clone(), args })],
+                body: vec![Lit::Pos(crate::ast::Atom {
+                    pred: pred.clone(),
+                    args,
+                })],
                 is_fact: false,
             });
             continue;
@@ -109,7 +112,15 @@ pub fn build(
                 });
                 continue;
             }
-            expand_rule(clauses, c, &pred, &adornment, &mut out, &mut worklist, &mut scheduled)?;
+            expand_rule(
+                clauses,
+                c,
+                &pred,
+                &adornment,
+                &mut out,
+                &mut worklist,
+                &mut scheduled,
+            )?;
         }
     }
 

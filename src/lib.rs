@@ -26,14 +26,14 @@
 //! ```
 
 pub mod agent;
-pub mod canonical;
 pub mod ast;
+pub mod canonical;
 pub mod eval;
+pub mod intern;
 #[cfg(feature = "llm")]
 pub mod llm;
 #[cfg(feature = "llm")]
 pub mod longmemeval;
-pub mod intern;
 pub mod magic;
 pub mod retrieval;
 pub mod scenario;
@@ -44,14 +44,15 @@ pub use agent::{
     assemble_context, AgentMemory, Episode, Extractor, IngestReport, LlmExtractor, MockExtractor,
     DEFAULT_RULES, EXTRACTION_PROMPT,
 };
-pub use scenario::{run_eval, EvalReport, Scenario};
+pub use ast::{parse_program, ClauseId, ParseError};
+pub use eval::{Ann, Annotation, Change, Engine, Interpret, StoredFact, StratError};
+pub use intern::{AggFn, Interner, Term, Value};
 pub use retrieval::{Bm25, Retrieval, Selection};
+pub use scenario::{run_eval, EvalReport, Scenario};
 pub use semantics::{Embedder, HashEmbedder, SemanticIndex, RELEVANCE_RULES};
-pub use ast::{parse_program, ParseError};
-pub use eval::{answer_text, Ann, Change, Engine, StoredFact, StratError};
-pub use intern::{Interner, Term, Value};
+pub use eval::answer_text;
 
-impl Engine {
+impl<A: Annotation> Engine<A> {
     /// Install (append) a rule program. Rules are identified by optional
     /// `name:` prefixes; unnamed rules get `rule/<head-pred>` labels used in
     /// `why()` output.
@@ -92,10 +93,7 @@ impl Engine {
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::ast::Lit;
         fn term_has_agg(t: &Term) -> bool {
-            match t {
-                Term::Agg(..) => true,
-                _ => false,
-            }
+            matches!(t, Term::Agg(..))
         }
         for c in clauses {
             if c.is_fact {

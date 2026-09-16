@@ -9,8 +9,8 @@
 //! minutes per call; the whole run takes ~30 minutes.
 
 use lemmalog::agent::AgentMemory;
-use lemmalog::llm::{LlmClientExtractor, OpenAiClient};
 use lemmalog::llm::HttpEmbedder;
+use lemmalog::llm::{LlmClientExtractor, OpenAiClient};
 use lemmalog::semantics::SemanticIndex;
 use lemmalog::Value;
 use std::time::Instant;
@@ -32,8 +32,14 @@ const ENTITIES: [(&str, &str); 7] = [
     ("Carol", "Carol, VP of engineering, mentor"),
     ("Dana", "Dana, manager at Gigant Systems"),
     ("Acme Corp", "Acme Corp, company, cloud products"),
-    ("Gigant Systems", "Gigant Systems, company, platform engineering"),
-    ("Zeta Analytics", "Zeta Analytics, analytics products company"),
+    (
+        "Gigant Systems",
+        "Gigant Systems, company, platform engineering",
+    ),
+    (
+        "Zeta Analytics",
+        "Zeta Analytics, analytics products company",
+    ),
 ];
 
 struct Question {
@@ -77,8 +83,11 @@ fn main() {
 
     println!("== lemmalog live: model={model} base={base} embed={embed_base} ==");
     let client = OpenAiClient::new(&base, &model, embed_model);
-    let mut m = AgentMemory::new(LlmClientExtractor::new(OpenAiClient::new(&base, &model, embed_model)), RULES)
-        .unwrap();
+    let mut m = AgentMemory::new(
+        LlmClientExtractor::new(OpenAiClient::new(&base, &model, embed_model)),
+        RULES,
+    )
+    .unwrap();
 
     // ---- ingestion: live extraction per session ----
     for (ts, text) in SESSIONS {
@@ -140,15 +149,22 @@ fn main() {
                 ));
             }
             // full employment history incl. superseded intervals
-            for (k, _) in m.engine.query("edge", &[Some(v), None, None, None, None, None]) {
-                if matches!(k[1], Value::Sym(ref r) if m.engine.interner.resolve(*r) == "works_at") {
+            for (k, _) in m
+                .engine
+                .query("edge", &[Some(v), None, None, None, None, None])
+            {
+                if matches!(k[1], Value::Sym(ref r) if m.engine.interner.resolve(*r) == "works_at")
+                {
                     ctx.push_str(&format!("history: {}\n", m.engine.render_fact("edge", &k)));
                 }
             }
         }
         let alice_sym = m.engine.sym("Alice");
         for row in m.engine.query("reports_to", &[Some(alice_sym), None]) {
-            ctx.push_str(&format!("derived: {}\n", m.engine.render_fact("reports_to", &row.0)));
+            ctx.push_str(&format!(
+                "derived: {}\n",
+                m.engine.render_fact("reports_to", &row.0)
+            ));
         }
         ctx.push_str("\n(An edge's 5th field is valid-to: 9223372036854775807 means still true.)");
 
@@ -177,7 +193,9 @@ fn main() {
         m.engine.sym("works_at"),
         m.engine.sym("Gigant Systems"),
     );
-    let hist = m.engine.query("edge", &[Some(a), Some(wa), Some(gig), None, None, None]);
+    let hist = m
+        .engine
+        .query("edge", &[Some(a), Some(wa), Some(gig), None, None, None]);
     if let Some((k, _)) = hist.first() {
         print!("{}", m.engine.why("edge", k));
     }

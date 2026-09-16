@@ -40,7 +40,11 @@ pub fn tokens3(s: &str) -> std::collections::BTreeSet<String> {
 /// what makes misattribution detectable — "grandma's gift to Melanie"
 /// scores 0 on Melanie's facts (the gift story is Caroline's). Near-token
 /// prefix matching ("painted" ~ "paint") included.
-pub fn topic_overlap(line_tokens: &std::collections::BTreeSet<String>, subj: &str, qt: &std::collections::BTreeSet<String>) -> usize {
+pub fn topic_overlap(
+    line_tokens: &std::collections::BTreeSet<String>,
+    subj: &str,
+    qt: &std::collections::BTreeSet<String>,
+) -> usize {
     let subj_toks = tokens3(subj);
     line_tokens
         .iter()
@@ -49,7 +53,9 @@ pub fn topic_overlap(line_tokens: &std::collections::BTreeSet<String>, subj: &st
                 && !subj_toks.contains(*t)
                 && qt.iter().any(|q| {
                     q.as_str() == t.as_str()
-                        || (q.len() >= 4 && t.len() >= 4 && (q.starts_with(t.as_str()) || t.starts_with(q.as_str())))
+                        || (q.len() >= 4
+                            && t.len() >= 4
+                            && (q.starts_with(t.as_str()) || t.starts_with(q.as_str())))
                 })
         })
         .count()
@@ -61,13 +67,24 @@ pub fn topic_overlap(line_tokens: &std::collections::BTreeSet<String>, subj: &st
 /// Applied identically to queries and indexed text.
 fn norm_token(t: &str) -> String {
     const IRREGULAR: [(&str, &str); 18] = [
-        ("flew", "fly"), ("flying", "fly"), ("flown", "fly"),
-        ("took", "take"), ("taking", "take"), ("taken", "take"),
-        ("went", "go"), ("going", "go"), ("gone", "go"),
-        ("bought", "buy"), ("buying", "buy"),
-        ("got", "get"), ("getting", "get"),
-        ("ate", "eat"), ("ran", "run"), ("stayed", "stay"),
-        ("moved", "move"), ("watched", "watch"),
+        ("flew", "fly"),
+        ("flying", "fly"),
+        ("flown", "fly"),
+        ("took", "take"),
+        ("taking", "take"),
+        ("taken", "take"),
+        ("went", "go"),
+        ("going", "go"),
+        ("gone", "go"),
+        ("bought", "buy"),
+        ("buying", "buy"),
+        ("got", "get"),
+        ("getting", "get"),
+        ("ate", "eat"),
+        ("ran", "run"),
+        ("stayed", "stay"),
+        ("moved", "move"),
+        ("watched", "watch"),
     ];
     if let Some(base) = IRREGULAR.iter().find(|(form, _)| *form == t) {
         return base.1.to_string();
@@ -84,14 +101,13 @@ fn tokenize(s: &str) -> Vec<String> {
     // once relation names split on `_` (`works_at` -> `works`, `at`),
     // poisoning BM25 with false overlaps
     const STOP: [&str; 22] = [
-        "a", "an", "the", "at", "in", "on", "of", "to", "is", "are", "was",
-        "were", "be", "do", "does", "did", "who", "what", "which", "for",
-        "with", "and",
+        "a", "an", "the", "at", "in", "on", "of", "to", "is", "are", "was", "were", "be", "do",
+        "does", "did", "who", "what", "which", "for", "with", "and",
     ];
     s.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| t.len() > 1 && !STOP.contains(t))
-        .map(|t| norm_token(t))
+        .map(norm_token)
         .collect()
 }
 
@@ -260,10 +276,7 @@ impl Retrieval {
                         entities.push(engine.interner.resolve(*s).to_string());
                     }
                 }
-                let prov = engine
-                    .fact(p, &key)
-                    .map(|f| f.ann.prov)
-                    .unwrap_or_default();
+                let prov = engine.fact(p, &key).map(|f| f.ann.prov).unwrap_or_default();
                 let idx = facts.len();
                 for e in &entities {
                     by_entity.entry(e.clone()).or_default().push(idx);
@@ -284,10 +297,7 @@ impl Retrieval {
         }
         let mut neighbors: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for (a, b) in co_occurrence.keys() {
-            neighbors
-                .entry(a.clone())
-                .or_default()
-                .insert(b.clone());
+            neighbors.entry(a.clone()).or_default().insert(b.clone());
         }
         // alias clusters bridge adjacency: after reconciliation, "car" and
         // "honda_civic" become one-hop neighbors even though facts stay
@@ -310,10 +320,7 @@ impl Retrieval {
             for a in members {
                 for b in members {
                     if a != b {
-                        neighbors
-                            .entry(a.clone())
-                            .or_default()
-                            .insert(b.clone());
+                        neighbors.entry(a.clone()).or_default().insert(b.clone());
                     }
                 }
             }
@@ -449,7 +456,9 @@ impl Retrieval {
             })
             .collect();
         ep_ranked.sort_by(|a, b| {
-            (b.2, b.1).partial_cmp(&(a.2, a.1)).unwrap_or(std::cmp::Ordering::Equal)
+            (b.2, b.1)
+                .partial_cmp(&(a.2, a.1))
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let ep_budget = budget_tokens.saturating_mul(4).saturating_sub(used);
@@ -494,7 +503,12 @@ impl Retrieval {
         }
         if !sel.episodes.is_empty() {
             let _ = writeln!(out, "\n== source episodes (verbatim) ==");
-            let ep_budget = sel.budget_tokens.saturating_mul(4).saturating_sub(sel.fact_lines.iter().map(|(l, _)| l.len() + 1).sum::<usize>());
+            let ep_budget = sel.budget_tokens.saturating_mul(4).saturating_sub(
+                sel.fact_lines
+                    .iter()
+                    .map(|(l, _)| l.len() + 1)
+                    .sum::<usize>(),
+            );
             let mut used = 0usize;
             for &i in &sel.episodes {
                 let ep = &self.episodes[i];

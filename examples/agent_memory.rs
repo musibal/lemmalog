@@ -5,12 +5,7 @@ use lemmalog::{Ann, Engine, Value};
 
 /// Ingest an episode: the extraction boundary (here a stand-in for the
 /// LLM OpenIE step) asserts annotated bi-temporal facts.
-fn ingest_episode(
-    e: &mut Engine,
-    episode: &str,
-    ts: i64,
-    facts: &[(&str, &str, &str)],
-) {
+fn ingest_episode(e: &mut Engine, episode: &str, ts: i64, facts: &[(&str, &str, &str)]) {
     for (s, p, o) in facts {
         let mut args = vec![e.sym(s), e.sym(p), e.sym(o)];
         args.extend([Value::Int(ts), Value::Int(i64::MAX), Value::Int(ts)]);
@@ -40,11 +35,16 @@ fn main() {
     .unwrap();
 
     println!("== turn 1 (t=100): episode ep1 ==");
-    ingest_episode(&mut e, "ep1", 100, &[
-        ("alice", "manager", "bob"),
-        ("bob", "manager", "carol"),
-        ("alice", "works_at", "acme"),
-    ]);
+    ingest_episode(
+        &mut e,
+        "ep1",
+        100,
+        &[
+            ("alice", "manager", "bob"),
+            ("bob", "manager", "carol"),
+            ("alice", "works_at", "acme"),
+        ],
+    );
     let (s1, acme) = (e.sym("s1"), e.sym("acme"));
     e.declare("mentions", &[s1, acme], Ann::base(0.9, ["q1"]));
     e.set_now(100);
@@ -72,7 +72,11 @@ fn main() {
     println!("re-derived {} facts after supersession", e.run());
     let (a3, wa) = (e.sym("alice"), e.sym("works_at"));
     for (k, a) in e.query("current", &[Some(a3), Some(wa), None]) {
-        println!("current employer: {} (conf {:.2})", e.render_fact("current", &k), a.conf);
+        println!(
+            "current employer: {} (conf {:.2})",
+            e.render_fact("current", &k),
+            a.conf
+        );
     }
     println!("conflicts flagged: {}", e.query("conflict", &[]).len());
 
@@ -82,7 +86,12 @@ fn main() {
     println!("\n== relevance diffusion from a query mentioning acme ==");
     let (s2, acme2) = (e.sym("s2"), e.sym("acme"));
     e.declare("mentions", &[s2, acme2], Ann::base(0.8, ["q2"]));
-    ingest_episode(&mut e, "ep3", 300, &[("acme", "links", "gigant"), ("gigant", "links", "zeta")]);
+    ingest_episode(
+        &mut e,
+        "ep3",
+        300,
+        &[("acme", "links", "gigant"), ("gigant", "links", "zeta")],
+    );
     e.set_now(300);
     e.run();
     let s2q = e.sym("s2");

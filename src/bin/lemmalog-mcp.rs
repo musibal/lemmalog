@@ -367,8 +367,18 @@ fn sync_clock(state: &mut State) {
     let t = wall_clock();
     let e = &mut state.memory.engine;
     if t > e.now {
+        let old = e.now;
+        let inert = e.clock_advance_is_inert(old, t);
         e.set_now(t);
-        e.invalidate_derived();
+        // Only the full re-derivation is skippable: `current/3` flips exactly
+        // when the clock passes an edge's valid-from/valid-to, and reads are
+        // far more frequent than facts crossing a boundary. `run()` stays
+        // unconditional — it must still flush a pending seminaive delta or a
+        // `program_dirty` left by an earlier install, and costs nothing when
+        // neither is outstanding.
+        if !inert {
+            e.invalidate_derived();
+        }
         let _ = e.run();
     }
 }

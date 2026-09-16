@@ -1,7 +1,7 @@
 //! The evaluation core: fact store, semiring annotations, stratification,
 //! seminaive fixpoint evaluation, and provenance tracking.
 
-use crate::ast::{Clause, ClauseId, CmpOp, Lit};
+use crate::ast::{Clause, ClauseId, CmpOp, Expr, Lit};
 use crate::intern::{AggFn, Interner, Term, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -747,6 +747,40 @@ impl<A: Annotation> Engine<A> {
     /// need it.
     pub fn invalidate_derived(&mut self) {
         self.program_dirty = true;
+    }
+
+    /// Whether advancing the clock from `old` to `new` leaves every derived
+    /// relation unchanged, letting the caller set `now` and skip the full
+    /// recompute that `invalidate_derived` forces.
+    ///
+    /// Sound by conservatism, in two steps. First, every clause that binds
+    /// `now` must use the clock *only* in comparisons against a variable
+    /// bound to an `edge` valid-from/valid-to — the shape of `current/3`
+    /// and of the `uso_relacion` projection. Such a comparison flips exactly
+    /// when the clock passes that edge timestamp. Any other use forfeits the
+    /// fast path: comparing the clock against a literal constant, or against
+    /// a timestamp carried by some other predicate, flips at an instant no
+    /// scan of `edge` can see, and arithmetic on the clock (`T - VF > D`) or
+    /// projecting it into the head can change on *any* advance. Second, no
+    /// edge valid-from/valid-to may lie in the half-open `(old, new]`: those
+    /// are precisely the instants at which a recognised comparison flips.
+    ///
+    /// Unknown shapes therefore cost a recompute, never a stale answer.
+    pub fn clock_advance_is_inert(&self, old: i64, new: i64) -> bool {
+        if !self.clauses.iter().all(clock_use_is_edge_bounded) {
+            return false;
+        }
+        let Some(rel) = self.relations.get("edge") else {
+            return true;
+        };
+        !rel.rows.iter().any(|row| {
+            row.key
+                .iter()
+                .skip(EDGE_VALID_FROM)
+                .take(2)
+                .filter_map(|v| v.as_int())
+                .any(|t| t > old && t <= new)
+        })
     }
 
     // ----------------------------------------------------------- stratify
@@ -2254,5 +2288,85 @@ fn cmp_holds(op: CmpOp, a: Value, b: Value) -> bool {
         CmpOp::Ge => a >= b,
         CmpOp::Eq => a == b,
         CmpOp::Ne => a != b,
+    }
+}
+
+/// Position of `valid_from` in an `edge` row; `valid_to` is the next column.
+const EDGE_VALID_FROM: usize = 3;
+
+/// Whether `c` uses the clock only in ways whose flips are exactly the
+/// `edge` valid-from/valid-to timestamps, so that scanning those two columns
+/// decides whether a clock advance can change this clause's answer.
+///
+/// Clauses that never bind `now` are trivially fine. For one that does, the
+/// clock variable may appear only as one side of a bare comparison whose
+/// other side is a variable bound, in this same clause, to a positive `edge`
+/// atom's valid-from or valid-to. Everything else is rejected: arithmetic on
+/// the clock, comparison against a constant or against a timestamp from
+/// another predicate, using the clock as a join value, or projecting it into
+/// the head.
+fn clock_use_is_edge_bounded(c: &Clause) -> bool {
+    let mut boundaries: BTreeSet<&str> = BTreeSet::new();
+    for lit in &c.body {
+        if let Lit::Pos(atom) = lit {
+            if atom.pred == "edge" {
+                for arg in atom.args.iter().skip(EDGE_VALID_FROM).take(2) {
+                    if let Term::Var(v) = arg {
+                        boundaries.insert(v.as_str());
+                    }
+                }
+            }
+        }
+    }
+
+    for lit in &c.body {
+        let Lit::Now(term) = lit else { continue };
+        // `now(0)` pins the view to a literal instant: nothing to scan for.
+        let Term::Var(clock) = term else { return false };
+
+        if c.head.args.iter().any(|a| term_mentions(a, clock)) {
+            return false;
+        }
+        for other in &c.body {
+            match other {
+                Lit::Now(_) => {}
+                Lit::Pos(atom) | Lit::Neg(atom) => {
+                    if atom.args.iter().any(|a| term_mentions(a, clock)) {
+                        return false;
+                    }
+                }
+                Lit::Cmp(_, lhs, rhs) => {
+                    if !term_mentions(lhs, clock) && !expr_mentions(rhs, clock) {
+                        continue;
+                    }
+                    let bounded = match (lhs, rhs) {
+                        (Term::Var(l), Expr::T(Term::Var(r))) => {
+                            (l == clock && boundaries.contains(r.as_str()))
+                                || (r == clock && boundaries.contains(l.as_str()))
+                        }
+                        _ => false,
+                    };
+                    if !bounded {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn term_mentions(t: &Term, var: &str) -> bool {
+    match t {
+        Term::Var(v) => v == var,
+        Term::Agg(_, inner) => term_mentions(inner, var),
+        _ => false,
+    }
+}
+
+fn expr_mentions(e: &Expr, var: &str) -> bool {
+    match e {
+        Expr::T(t) => term_mentions(t, var),
+        Expr::Add(a, b) | Expr::Sub(a, b) => expr_mentions(a, var) || expr_mentions(b, var),
     }
 }

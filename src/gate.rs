@@ -473,16 +473,68 @@ fn loop_decision(review: &Value) -> Value {
     }
     json!({"choice":"pass","reason":"high_confidence_consistent_pass","probability":probability})
 }
+/// Approved builders: id -> shell command. Source of truth is the volume file
+/// (default /data/builders.json, LEMMALOG_GAUNTLET_BUILDERS_PATH), so a
+/// `docker compose up -d` by anyone keeps the registry; the env var is the
+/// fallback for native runs without a volume. An empty registry is fail-loud:
+/// gate_decide would reject every rework with "builder ... is not approved".
+fn builders() -> &'static Value {
+    static REGISTRY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let path = std::env::var("LEMMALOG_GAUNTLET_BUILDERS_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/data/builders.json"));
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(map) = serde_json::from_str::<Value>(&raw) {
+                if map.is_object() {
+                    return map;
+                }
+                eprintln!("lemmajevgaun: {path:?} is not a JSON object of builders");
+            } else {
+                eprintln!("lemmajevgaun: {path:?} is not JSON; falling back to the env");
+            }
+        }
+        std::env::var("LEMMALOG_GAUNTLET_BUILDERS_JSON")
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .unwrap_or_else(|| Value::Object(Default::default()))
+    })
+}
+
+/// Read-only view of the approved builders for the MCP surface.
+pub fn builders_list() -> Value {
+    builders().clone()
+}
+
+/// Startup check: an empty registry blocks every rework cycle, and the
+/// operator had no way to notice until a decide failed (bead lemmalog-src-05x).
+pub fn warn_if_no_builders() {
+    let n = builders().as_object().map_or(0, |m| m.len());
+    if n == 0 {
+        eprintln!(
+            "GAUNTLET: no approved builder (empty builders file and LEMMALOG_GAUNTLET_BUILDERS_JSON); gate_decide will reject every rework with 'builder ... is not approved'"
+        );
+    }
+}
+
 fn builder_command(name: &str) -> Result<String, String> {
-    let raw = std::env::var("LEMMALOG_GAUNTLET_BUILDERS_JSON").map_err(|_| {
-        "LEMMALOG_GAUNTLET_BUILDERS_JSON must map approved builder ids to commands".to_string()
-    })?;
-    let map: Value = serde_json::from_str(&raw)
-        .map_err(|_| "LEMMALOG_GAUNTLET_BUILDERS_JSON must be JSON".to_string())?;
-    map.get(name)
+    builders()
+        .get(name)
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| format!("builder {name:?} is not approved"))
+        .ok_or_else(|| {
+            let approved: Vec<&str> = builders().as_object().map_or_else(Vec::new, |m| {
+                let mut v: Vec<&str> = m.keys().map(String::as_str).collect();
+                v.sort_unstable();
+                v
+            });
+            format!(
+                "builder {name:?} is not approved; registry has [{}] — write the id into {} or LEMMALOG_GAUNTLET_BUILDERS_JSON",
+                approved.join(", "),
+                std::env::var("LEMMALOG_GAUNTLET_BUILDERS_PATH")
+                    .unwrap_or_else(|_| "/data/builders.json".to_string())
+            )
+        })
 }
 fn build(name: &str, packet: &Value) -> Result<Value, String> {
     let command = builder_command(name)?;

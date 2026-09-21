@@ -835,7 +835,7 @@ fn load_folds_a_per_value_queue_into_one_line_per_slot() {
     let kept = &m2.escalations()[0];
     assert!(kept.contains("ep2"), "sobrevive la mas completa: {kept}");
     assert!(
-        kept.contains("fix: multi(\"sabor\")"),
+        kept.contains("fix: lemmalog_install_rules with `multi(\"sabor\").`"),
         "el remedio viaja con la linea: {kept}"
     );
     assert!(!kept.contains("ep1, but"), "la vieja se pliega, no se copia: {kept}");

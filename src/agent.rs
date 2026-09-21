@@ -595,7 +595,7 @@ impl<X: Extractor> AgentMemory<X> {
     /// being a dead end for the agent reading it.
     fn escalation_remedy(pred: &str) -> String {
         format!(
-            " fix: multi(\"{}\"). keeps both (old values stay open, on purpose); \
+            " fix: lemmalog_install_rules with `multi(\"{}\").` keeps both (old values stay open, on purpose); \
              exclusive(\"{}\"). then RE-ASSERT the survivor — declaring it \
              does not close the values already open",
             pred, pred

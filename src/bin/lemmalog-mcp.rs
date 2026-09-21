@@ -52,6 +52,7 @@ fn main() {
             }
         }
     }
+    gate::warn_if_no_builders();
     let state = State { memory, path };
     if let Ok(addr) = std::env::var("LEMMALOG_MCP_HTTP") {
         let listener = TcpListener::bind(&addr).expect("bind LEMMALOG_MCP_HTTP");
@@ -432,6 +433,7 @@ fn tools() -> J {
         json!({"name":"gate_answer","description":"Re-resolve one gate evidence ref directly against Lemmalog. Caller supplied facts are never accepted.","inputSchema":{"type":"object","properties":{"gate_id":{"type":"string"},"ref":{"type":"string"}},"required":["gate_id","ref"]}}),
         json!({"name":"gate_decide","description":"Run the bounded Gauntlet Loop. One JEV multi-question call per cycle judges the complete, evidence-enriched artifact; only an approved builder id may revise it.","inputSchema":{"type":"object","properties":{"gate_id":{"type":"string"},"builder":{"type":"string"},"max_cycles":{"type":"integer","minimum":1}},"required":["gate_id","builder"]}}),
         json!({"name":"gate_outcome","description":"Record whether a completed gate was correct for calibration. Requires gate_decide first.","inputSchema":{"type":"object","properties":{"gate_id":{"type":"string"},"was_correct":{"type":"boolean"},"defect":{},"evidence":{}},"required":["gate_id","was_correct"]}}),
+        json!({"name":"gate_builders_list","description":"List the approved Gauntlet builders (id -> command) the daemon loaded: the volume registry with the env var as fallback. Read-only.","inputSchema":{"type":"object","properties":{}}}),
     ])
 }
 
@@ -938,18 +940,53 @@ let purged = state.memory.purge_declared_escalations();
             }
         }
         "lemmalog_dump" => {
+            // A wrong arg name used to read as "dump everything": a caller
+            // asking for one predicate got the whole store, 234k lines, in
+            // silence (bead lemmalog-src-05x). Reject unknown keys instead.
+            for key in args.as_object().into_iter().flat_map(|m| m.keys()) {
+                if key != "pred" {
+                    return Err(format!(
+                        "input: lemmalog_dump takes `pred` (a relation name), not {key:?}"
+                    ));
+                }
+            }
+            if let Some(p) = args.get("pred") {
+                if !p.is_string() {
+                    return Err("input: `pred` must be a string (relation name)".to_string());
+                }
+            }
             let pred = args["pred"].as_str().unwrap_or_default();
             sync_clock(state);
             let e = engine_of(state);
-            let mut preds: Vec<&String> = e.relations.keys().collect();
-            preds.sort();
             let mut out = String::new();
-            for p in preds {
-                if !pred.is_empty() && p != pred {
-                    continue;
+            if pred.is_empty() {
+                let mut preds: Vec<&String> = e.relations.keys().collect();
+                preds.sort();
+                for p in preds {
+                    for key in e.relation_keys(p) {
+                        out.push_str(&format!("{}\n", e.render_fact(p, &key)));
+                    }
                 }
-                for key in e.relation_keys(p) {
-                    out.push_str(&format!("{}\n", e.render_fact(p, &key)));
+            } else {
+                // Facts live as rows of `edge` with the relation name in the
+                // P column: a pred filter that only matched relation KEYS
+                // found nothing and the tool read as "no filter at all"
+                // (bead lemmalog-src-05x). Select the edge rows of that
+                // relation, plus any program predicate of the same name.
+                if let Some(sym) = e.interner.lookup(pred) {
+                    for key in e.relation_keys("edge") {
+                        if key[1] == Value::Sym(sym) {
+                            out.push_str(&format!(
+                                "{} --{}--> {}\n",
+                                e.interner.display(&key[0]),
+                                e.interner.display(&key[1]),
+                                e.interner.display(&key[2])
+                            ));
+                        }
+                    }
+                }
+                for key in e.relation_keys(pred) {
+                    out.push_str(&format!("{}\n", e.render_fact(pred, &key)));
                 }
             }
             if out.is_empty() {
@@ -1054,6 +1091,7 @@ let purged = state.memory.purge_declared_escalations();
             gate::decide(engine_of(state), args).map(|v| v.to_string())
         }
         "gate_outcome" => gate::outcome(args).map(|v| v.to_string()),
+        "gate_builders_list" => Ok(gate::builders_list().to_string()),
         other => {
             // models invent tool names; teach instead of rejecting —
             // suggest the closest real tool so the next call succeeds
@@ -1081,6 +1119,7 @@ let purged = state.memory.purge_declared_escalations();
                 "gate_answer",
                 "gate_decide",
                 "gate_outcome",
+                "gate_builders_list",
             ]
             .to_vec();
             let stripped = other.trim_start_matches("lemmalog_");
@@ -1170,7 +1209,7 @@ mod tests {
     fn every_tool_schema_lists_only_its_own_properties() {
         let ts = tools();
         let list = ts.as_array().unwrap();
-        assert_eq!(list.len(), 23);
+        assert_eq!(list.len(), 24);
         for t in list {
             let props: Vec<&str> = t["inputSchema"]["properties"]
                 .as_object()

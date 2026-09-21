@@ -34,6 +34,9 @@ Docker network use `http://lemmajevgaun:8765/mcp`. Persisted facts, gate
 sessions, and calibration are in the Docker volume. Supply `TYPESAFE_API_KEY`
 to the container; approved Gauntlet builders are the server-side JSON map
 `LEMMALOG_GAUNTLET_BUILDERS_JSON`, never a command supplied by an MCP caller.
+The registry loads from the volume (`/data/builders.json`, overridable via
+`LEMMALOG_GAUNTLET_BUILDERS_PATH`) with the env var as fallback; `gate_builders_list`
+shows it read-only, and the daemon warns at startup when it is empty.
 
 ## The discipline
 

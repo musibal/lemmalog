@@ -9,7 +9,7 @@ services:
       # Builder IDs, not caller-provided shell commands. artifact-echo re-emits
       # the packet artifact unchanged (/data/gauntlet-builder.sh), so a rework
       # cycle ends builder_noop -> final "rework" instead of an MCP error.
-      LEMMALOG_GAUNTLET_BUILDERS_JSON: '{"artifact-echo":"/bin/sh /data/gauntlet-scripts/gauntlet-builder-echo.sh"}'
+      LEMMALOG_GAUNTLET_BUILDERS_JSON: '{"artifact-echo":"/bin/sh /data/gauntlet-scripts/gauntlet-builder-echo.sh","artifact-revise":"/usr/local/bin/lemmajevgaun-revise"}'
       LEMMALOG_MCP_PATH: /data/lemmalog-memory.snapshot
     mem_limit: 14g
     memswap_limit: 14g

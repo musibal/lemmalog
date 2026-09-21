@@ -38,6 +38,18 @@ The registry loads from the volume (`/data/builders.json`, overridable via
 `LEMMALOG_GAUNTLET_BUILDERS_PATH`) with the env var as fallback; `gate_builders_list`
 shows it read-only, and the daemon warns at startup when it is empty.
 
+Approved builders (`gate_decide(gate_id, builder, max_cycles)` runs the
+rework cycle against the one you name; check `gate_builders_list` first):
+
+- `artifact-echo` re-emits the artifact unchanged, so a rework cycle ends
+  `builder_noop` → final `rework`. Smoke-test the loop only.
+- `artifact-revise` makes the one deterministic repair a script can make:
+  when JEV fails the `evidence` dimension it retracts the artifact's
+  unverified evidence lines (`NO RESUELTO` / `OBSOLETO` from the machine
+  packet) and records them as `retractions`. Any other failed dimension, or
+  nothing left to retract, fails loudly — scope/acceptance/safety gaps
+  always come back to you, never get papered over.
+
 ## The discipline
 
 1. **Commit verified evidence atomically.** The agent/domain adapter turns

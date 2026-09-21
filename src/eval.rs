@@ -1459,7 +1459,11 @@ impl<A: Annotation> Engine<A> {
     }
 
     /// Uninstall a rule batch (revertable rules). Derived facts are
-    /// recomputed on the next `run()` without the removed rules.
+    /// recomputed on the next `run()` without the removed rules, and the
+    /// rows the batch's own fact clauses already fed into base relations
+    /// (e.g. `multi("r").` declarations) are removed too: otherwise a
+    /// declaration stays asserted forever with no MCP way to retract it
+    /// (bead lemmalog-src-l53).
     pub fn uninstall(&mut self, id: &str) -> bool {
         let Some(pos) = self.rule_batches.iter().position(|(b, _, _)| b == id) else {
             return false;
@@ -1470,6 +1474,29 @@ impl<A: Annotation> Engine<A> {
             None => 0,
         };
         if start <= end && end <= self.clauses.len() {
+            let fact_clauses: Vec<_> = self.clauses[start..end]
+                .iter()
+                .filter(|c| c.is_fact)
+                .map(|c| (c.head.pred.clone(), c.head.args.clone()))
+                .collect();
+            for (pred, head_args) in fact_clauses {
+                let Some(args) = self.ground_args(&head_args) else {
+                    continue;
+                };
+                let removed = self
+                    .relations
+                    .get_mut(&pred)
+                    .map_or(false, |rel| rel.remove(&args.to_vec()));
+                if removed {
+                    // ponytail: a row identically asserted by an episode would
+                    // be removed too; the operator can re-assert it via MCP.
+                    // Proper fix = Support::Program{batch} provenance on
+                    // clause-fed rows, only if this corner ever bites.
+                    let entry = (pred.clone(), args.to_vec());
+                    self.feed.push(Change::Retracted(self.epoch, entry.clone()));
+                    self.change_log.push((self.epoch, entry));
+                }
+            }
             self.clauses.drain(start..end);
             // renumber the ends of later batches
             let removed = end - start;

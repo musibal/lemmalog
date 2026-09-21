@@ -501,3 +501,23 @@ fn negation_invalidated_by_later_additions() {
     e.run();
     assert_eq!(e.query("p", &[]).len(), 1);
 }
+
+#[test]
+fn uninstall_reverts_batch_fact_declarations() {
+    // bead lemmalog-src-l53: a batch's own fact clauses (e.g. multi("r").)
+    // feed rows into base relations; uninstall must remove them, otherwise
+    // the declaration stays asserted forever with no MCP way to retract it.
+    let mut e = Engine::new();
+    e.install_program("multi(\"test_rel\").").unwrap();
+    e.run();
+    let rel = e.sym("test_rel");
+    assert_eq!(e.query("multi", &[Some(rel.clone())]).len(), 1);
+    let batch = e.rule_batches.last().unwrap().0.clone();
+    assert!(e.uninstall(&batch));
+    e.run();
+    assert_eq!(
+        e.query("multi", &[Some(rel)]).len(),
+        0,
+        "uninstall must remove the declaration the batch asserted"
+    );
+}

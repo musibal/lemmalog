@@ -26,12 +26,14 @@
 use lemmalog::agent::AgentMemory;
 use lemmalog::canonical;
 use lemmalog::eval::Engine;
+use lemmalog::gate;
 use lemmalog::intern::Value;
 use serde_json::{json, Value as J};
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 struct State {
     memory: AgentMemory<lemmalog::agent::MockExtractor>,
@@ -87,17 +89,28 @@ fn main() {
 
 /// Shared HTTP transport: one in-memory store serves multiple agents instead
 /// of separate stores that overwrite each other's snapshots.
+fn verbose_logs() -> bool {
+    matches!(
+        std::env::var("LEMMALOG_MCP_LOG_BODIES").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+    )
+}
+
 fn handle(state: &mut State, msg: &J) -> Option<J> {
     let id = msg.get("id").cloned();
-    if id.is_none() {
-        return None; // notification (e.g. initialized): no response
-    }
+    let notification = id.is_none();
     let method = msg["method"].as_str().unwrap_or_default().to_string();
+    let operation = if method == "tools/call" {
+        msg["params"]["name"].as_str().unwrap_or_default()
+    } else {
+        &method
+    };
+    let started = Instant::now();
     let result = match method.as_str() {
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "lemmalog", "version": env!("CARGO_PKG_VERSION")},
+            "serverInfo": {"name": "lemmajevgaun", "version": env!("CARGO_PKG_VERSION")},
             "instructions": SERVER_INSTRUCTIONS
         })),
         "tools/list" => Ok(json!({"tools": tools()})),
@@ -109,14 +122,142 @@ fn handle(state: &mut State, msg: &J) -> Option<J> {
         }
         other => Err(format!("unknown method {other:?}")),
     };
-    let id = id.unwrap();
-    Some(match result {
-        Ok(v) => json!({"jsonrpc": "2.0", "id": id, "result": v}),
-        Err(e) => json!({
-            "jsonrpc": "2.0", "id": id,
-            "error": {"code": -32000, "message": e}
-        }),
-    })
+    let outcome = match &result {
+        Err(_) => "rpc_error",
+        Ok(value) if value["isError"].as_bool() == Some(true) => "tool_error",
+        Ok(_) => "ok",
+    };
+    let response = if notification {
+        None
+    } else {
+        let id = id.expect("non-notification has an id");
+        Some(match result {
+            Ok(v) => json!({"jsonrpc": "2.0", "id": id, "result": v}),
+            Err(e) => json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": {"code": -32000, "message": e}
+            }),
+        })
+    };
+    if verbose_logs() {
+        let input = &msg["params"]["arguments"];
+        let output = response
+            .as_ref()
+            .and_then(|value| {
+                value["result"]["content"][0]["text"]
+                    .as_str()
+                    .map(J::from)
+                    .or_else(|| Some(value.clone()))
+            })
+            .unwrap_or(J::Null);
+        let question = match operation {
+            "lemmalog_query" | "lemmalog_query_deep" => input.get("goal"),
+            "lemmalog_context" => input.get("query"),
+            "lemmalog_why" => input.get("fact"),
+            _ => None,
+        };
+        if let Some(question) = question {
+            eprintln!(
+                "lemmajevgaun: op={operation} id={} outcome={outcome} elapsed_ms={} question={} answer={}",
+                msg["id"],
+                started.elapsed().as_millis(),
+                question,
+                output,
+            );
+        } else {
+            eprintln!(
+                "lemmajevgaun: op={operation} id={} outcome={outcome} elapsed_ms={} input={} output={}",
+                msg["id"],
+                started.elapsed().as_millis(),
+                input,
+                output,
+            );
+        }
+    } else {
+        eprintln!(
+            "lemmajevgaun: op={operation} outcome={outcome} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
+    response
+}
+
+fn transient_snapshot_path() -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "lemmalog-mcp-{}-{nonce}.snapshot",
+        std::process::id()
+    ))
+}
+
+/// Magic for a snapshot blob that carries more than the engine. A bare blob is the
+/// pre-v2 format (engine bytes only) and still restores, so DO checkpoints written
+/// before gate state was included are not lost.
+const SNAPSHOT_MAGIC: &[u8] = b"LEMMASNAP2\n";
+
+fn pack_snapshot(engine: &[u8], gates: &J) -> Result<Vec<u8>, String> {
+    let gates = serde_json::to_vec(gates).map_err(|e| format!("snapshot gates: {e}"))?;
+    let mut out = Vec::with_capacity(SNAPSHOT_MAGIC.len() + 4 + engine.len() + gates.len());
+    out.extend_from_slice(SNAPSHOT_MAGIC);
+    out.extend_from_slice(&(engine.len() as u32).to_be_bytes());
+    out.extend_from_slice(engine);
+    out.extend_from_slice(&gates);
+    Ok(out)
+}
+
+fn unpack_snapshot(bytes: &[u8]) -> Result<(&[u8], Option<J>), String> {
+    if !bytes.starts_with(SNAPSHOT_MAGIC) {
+        return Ok((bytes, None));
+    }
+    let rest = &bytes[SNAPSHOT_MAGIC.len()..];
+    if rest.len() < 4 {
+        return Err("snapshot: truncated header".to_string());
+    }
+    let len = u32::from_be_bytes(rest[..4].try_into().expect("4 bytes")) as usize;
+    if rest.len() < 4 + len {
+        return Err("snapshot: truncated engine section".to_string());
+    }
+    let gates = serde_json::from_slice(&rest[4 + len..])
+        .map_err(|e| format!("snapshot: gate section: {e}"))?;
+    Ok((&rest[4..4 + len], Some(gates)))
+}
+
+fn export_snapshot(state: &State) -> Result<Vec<u8>, String> {
+    let path = transient_snapshot_path();
+    let engine = state
+        .memory
+        .save(
+            path.to_str()
+                .ok_or("temporary snapshot path is not UTF-8")?,
+        )
+        .and_then(|_| std::fs::read(&path));
+    let _ = std::fs::remove_file(&path);
+    let engine = engine.map_err(|e| format!("snapshot: {e}"))?;
+    // ponytail: engine + gates ride one DO storage value; gate artifacts are the
+    // growth term. Split into `gates:<id>` keys only if a blob approaches the
+    // per-value limit.
+    pack_snapshot(&engine, &gate::export_state()?)
+}
+
+fn restore_snapshot(state: &mut State, bytes: &[u8]) -> Result<(), String> {
+    let (engine, gates) = unpack_snapshot(bytes)?;
+    let path = transient_snapshot_path();
+    std::fs::write(&path, engine).map_err(|e| format!("restore: {e}"))?;
+    let restored = AgentMemory::load(
+        lemmalog::agent::MockExtractor::new(0.9),
+        path.to_str()
+            .ok_or("temporary snapshot path is not UTF-8")?,
+    )
+    .map_err(|e| format!("restore: {e}"));
+    let _ = std::fs::remove_file(&path);
+    state.memory = restored?;
+    if let Some(gates) = gates {
+        gate::restore_state(&gates)?;
+    }
+    Ok(())
 }
 
 fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<State>>) {
@@ -130,13 +271,41 @@ fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<State>>) {
                 return;
             }
         };
-        let Some((headers_end, content_length, method)) = request else {
+        let Some((headers_end, content_length, method, path)) = request else {
             return;
         };
         let body_end = headers_end + content_length;
         let body = buffer[headers_end..body_end].to_vec();
         buffer.drain(..body_end);
 
+        if method == "GET" && path == "/health" {
+            if write_http_response(&mut stream, "200 OK", br#"{"ok":true}"#).is_err() {
+                return;
+            }
+            continue;
+        }
+        if method == "GET" && path == "/_snapshot" {
+            let result = export_snapshot(&state.lock().expect("state lock poisoned"));
+            let (status, body) = match result {
+                Ok(bytes) => ("200 OK", bytes),
+                Err(e) => ("500 Internal Server Error", e.into_bytes()),
+            };
+            if write_http_response(&mut stream, status, &body).is_err() {
+                return;
+            }
+            continue;
+        }
+        if method == "PUT" && path == "/_restore" {
+            let result = restore_snapshot(&mut state.lock().expect("state lock poisoned"), &body);
+            let (status, body) = match result {
+                Ok(()) => ("200 OK", Vec::new()),
+                Err(e) => ("400 Bad Request", e.into_bytes()),
+            };
+            if write_http_response(&mut stream, status, &body).is_err() {
+                return;
+            }
+            continue;
+        }
         if method != "POST" {
             if write_http_response(&mut stream, "405 Method Not Allowed", &[]).is_err() {
                 return;
@@ -173,7 +342,7 @@ fn read_request(
     stream: &mut TcpStream,
     buffer: &mut Vec<u8>,
     chunk: &mut [u8],
-) -> std::io::Result<Option<(usize, usize, String)>> {
+) -> std::io::Result<Option<(usize, usize, String, String)>> {
     let headers_end = loop {
         if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
             break pos + 4;
@@ -188,11 +357,9 @@ fn read_request(
         std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid HTTP headers")
     })?;
     let mut lines = headers.lines();
-    let method = lines
-        .next()
-        .and_then(|line| line.split_whitespace().next())
-        .unwrap_or_default()
-        .to_string();
+    let mut request_line = lines.next().unwrap_or_default().split_whitespace();
+    let method = request_line.next().unwrap_or_default().to_string();
+    let path = request_line.next().unwrap_or_default().to_string();
     let content_length = lines
         .filter_map(|line| line.split_once(':'))
         .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
@@ -212,7 +379,7 @@ fn read_request(
         }
         buffer.extend_from_slice(&chunk[..n]);
     }
-    Ok(Some((headers_end, content_length, method)))
+    Ok(Some((headers_end, content_length, method, path)))
 }
 
 fn write_http_response(stream: &mut TcpStream, status: &str, body: &[u8]) -> std::io::Result<()> {
@@ -256,21 +423,30 @@ fn tools() -> J {
             "Resync after a context reset or another agent's work: everything asserted, derived, or retracted since an epoch. Input: optional `since` epoch integer (default: 0 = everything, capped). The response carries the current epoch — checkpoint it and pass it back next time.", &["since"], &[]),
         tool("lemmalog_save", "Persist memory to LEMMALOG_MCP_PATH.", &[], &[]),
         tool("lemmalog_run", "Sync the clock to the present and run one maintenance epoch (usually automatic — every read does it).", &[], &[]),
+        tool("lemmalog_commit",
+            "Atomically apply an adapter-proposed evidence diff. `actor` and `evidence` are required; send multiline `retract` and/or `observe`. Values that merely changed belong only in `observe` under the same relation; reserve `retract` for facts proven false. The server persists once after the complete diff.", &[
+                "actor", "evidence", "retract", "observe", "ts"
+            ], &["actor", "evidence"]),
+        json!({"name":"gate_open","description":"Open a lemmajevgaun evidence gate. `case` is the complete {id, artifact} object; evidence refs are subject|relation|object. Resolves facts in-process before JEV sees the artifact.","inputSchema":{"type":"object","properties":{"case":{"type":"object"},"evidence_refs":{"type":"array","items":{"type":"string"}}},"required":["case"]}}),
+        json!({"name":"gate_ask","description":"List unresolved or stale evidence questions for an opened gate.","inputSchema":{"type":"object","properties":{"gate_id":{"type":"string"}},"required":["gate_id"]}}),
+        json!({"name":"gate_answer","description":"Re-resolve one gate evidence ref directly against Lemmalog. Caller supplied facts are never accepted.","inputSchema":{"type":"object","properties":{"gate_id":{"type":"string"},"ref":{"type":"string"}},"required":["gate_id","ref"]}}),
+        json!({"name":"gate_decide","description":"Run the bounded Gauntlet Loop. One JEV multi-question call per cycle judges the complete, evidence-enriched artifact; only an approved builder id may revise it.","inputSchema":{"type":"object","properties":{"gate_id":{"type":"string"},"builder":{"type":"string"},"max_cycles":{"type":"integer","minimum":1}},"required":["gate_id","builder"]}}),
+        json!({"name":"gate_outcome","description":"Record whether a completed gate was correct for calibration. Requires gate_decide first.","inputSchema":{"type":"object","properties":{"gate_id":{"type":"string"},"was_correct":{"type":"boolean"},"defect":{},"evidence":{}},"required":["gate_id","was_correct"]}}),
     ])
 }
 
 /// Sent on initialize; clients prepend it to the model's context. Small
 /// models never read the README — they read this.
 const SERVER_INSTRUCTIONS: &str = "\
-Lemmalog is your working memory: assert facts as you verify them \
-(S --rel[conf]--> O), derive with rules, and when a fact turns out \
-WRONG call lemmalog_retract (the response lists which conclusions \
-died). Asserted facts are queried as current(Subject, \"rel\", Object) \
-— querying rel(X, Y) directly returns nothing. For a changed value, \
-re-assert the same relation (old one supersedes). lemmalog_changes \
-with your last epoch resyncs you after context resets. Use \
-lemmalog_escalations to inspect queued conflicts and \
-lemmalog_resolve_escalation to dismiss one by index.";
+Lemmalog is your working memory. Start durable work with lemmalog_context \
+or lemmalog_query, and use lemmalog_why before trusting derivations. \
+A normal agent commits verified source-backed diffs only through \
+lemmalog_commit({actor,evidence,observe?,retract?,ts?}); do not call \
+naked lemmalog_observe or lemmalog_retract. Query asserted triples as \
+current(Subject, \"rel\", Object); values that change are re-asserted under \
+the same relation. For a decision use gate_open, gate_ask, gate_answer, \
+gate_decide, and gate_outcome in order. JEV proposes but never mutates or \
+executes effects. lemmalog_changes resyncs after context resets.";
 
 /// Property descriptions shared by the per-tool schemas (each tool
 /// advertises only the properties it actually takes — a model that sees
@@ -656,9 +832,9 @@ let purged = state.memory.purge_declared_escalations();
             }
         }
         "lemmalog_resolve_escalation" => {
-            let raw_index = args["index"].as_i64().ok_or_else(|| {
-                "input: `index` is required and must be an integer".to_string()
-            })?;
+            let raw_index = args["index"]
+                .as_i64()
+                .ok_or_else(|| "input: `index` is required and must be an integer".to_string())?;
             let queue_len = state.memory.escalations().len();
             if raw_index < 0 || raw_index as usize >= queue_len {
                 Err(format!(
@@ -758,7 +934,7 @@ let purged = state.memory.purge_declared_escalations();
                 Err("input: `query` is required — the natural-language question the context should serve".to_string())
             } else {
                 sync_clock(state);
-                Ok(state.memory.context_for_query_rich(&query, budget))
+                Ok(state.memory.context_for_query(&query, budget))
             }
         }
         "lemmalog_dump" => {
@@ -795,16 +971,116 @@ let purged = state.memory.purge_declared_escalations();
             let n = engine_of(state).run();
             Ok(format!("+{n} facts (clock {})", engine_of(state).now))
         }
+        "lemmalog_commit" => {
+            let actor = args["actor"].as_str().unwrap_or_default().trim();
+            let evidence = args["evidence"].as_str().unwrap_or_default().trim();
+            let retract = args["retract"].as_str().unwrap_or_default();
+            let observe = args["observe"].as_str().unwrap_or_default();
+            if actor.is_empty() || evidence.is_empty() {
+                Err("input: `actor` and `evidence` are required for an evidence diff".to_string())
+            } else if retract.trim().is_empty() && observe.trim().is_empty() {
+                Err("input: provide non-empty `retract` and/or `observe` facts".to_string())
+            } else {
+                // The engine mutates in place. Snapshot before the first half so a
+                // rejected second half cannot leave a partial in-memory commit.
+                let before = export_snapshot(state)?;
+                let applied = (|| -> Result<Vec<String>, String> {
+                    let mut reports = Vec::new();
+                    // Apply removals first so an optional re-assertion is final.
+                    // `None` suppresses inner saves; the outer commit saves once.
+                    if !retract.trim().is_empty() {
+                        let result =
+                            tool_call(state, "lemmalog_retract", &json!({"facts": retract}), None)?;
+                        if result["isError"].as_bool() == Some(true) {
+                            return Err(result["content"][0]["text"]
+                                .as_str()
+                                .unwrap_or("retract rejected")
+                                .to_string());
+                        }
+                        reports.push(
+                            result["content"][0]["text"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                    }
+                    if !observe.trim().is_empty() {
+                        let mut request = json!({"facts": observe});
+                        if let Some(ts) = args["ts"].as_i64() {
+                            request["ts"] = json!(ts);
+                        }
+                        let result = tool_call(state, "lemmalog_observe", &request, None)?;
+                        let report = result["content"][0]["text"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
+                        if result["isError"].as_bool() == Some(true) || report.contains("dropped ")
+                        {
+                            return Err(if report.is_empty() {
+                                "observe rejected".to_string()
+                            } else {
+                                report
+                            });
+                        }
+                        reports.push(report);
+                    }
+                    Ok(reports)
+                })();
+                match applied {
+                    Ok(reports) => Ok(format!(
+                        "actor={actor} evidence={evidence}\n{}",
+                        reports.join("\n")
+                    )),
+                    Err(error) => {
+                        restore_snapshot(state, &before).map_err(|restore| {
+                            format!("commit aborted: {error}; rollback failed: {restore}")
+                        })?;
+                        Err(format!("commit aborted and rolled back: {error}"))
+                    }
+                }
+            }
+        }
+        "gate_open" => {
+            sync_clock(state);
+            gate::open(engine_of(state), args).map(|v| v.to_string())
+        }
+        "gate_ask" => gate::ask(args).map(|v| v.to_string()),
+        "gate_answer" => {
+            sync_clock(state);
+            gate::answer(engine_of(state), args).map(|v| v.to_string())
+        }
+        "gate_decide" => {
+            sync_clock(state);
+            gate::decide(engine_of(state), args).map(|v| v.to_string())
+        }
+        "gate_outcome" => gate::outcome(args).map(|v| v.to_string()),
         other => {
             // models invent tool names; teach instead of rejecting —
             // suggest the closest real tool so the next call succeeds
             let known: Vec<&str> = [
-                "lemmalog_observe", "lemmalog_retract", "lemmalog_query",
-                "lemmalog_query_deep", "lemmalog_why", "lemmalog_install_rules",
-                "lemmalog_uninstall", "lemmalog_batches", "lemmalog_what_if",
-                "lemmalog_canonicalize", "lemmalog_context", "lemmalog_dump",
-                "lemmalog_changes", "lemmalog_save", "lemmalog_run",
-                "lemmalog_escalations", "lemmalog_resolve_escalation",
+                "lemmalog_observe",
+                "lemmalog_retract",
+                "lemmalog_query",
+                "lemmalog_query_deep",
+                "lemmalog_why",
+                "lemmalog_install_rules",
+                "lemmalog_uninstall",
+                "lemmalog_batches",
+                "lemmalog_what_if",
+                "lemmalog_canonicalize",
+                "lemmalog_context",
+                "lemmalog_dump",
+                "lemmalog_changes",
+                "lemmalog_save",
+                "lemmalog_run",
+                "lemmalog_commit",
+                "lemmalog_escalations",
+                "lemmalog_resolve_escalation",
+                "gate_open",
+                "gate_ask",
+                "gate_answer",
+                "gate_decide",
+                "gate_outcome",
             ]
             .to_vec();
             let stripped = other.trim_start_matches("lemmalog_");
@@ -849,6 +1125,7 @@ let purged = state.memory.purge_declared_escalations();
                 | "lemmalog_uninstall"
                 | "lemmalog_canonicalize"
                 | "lemmalog_resolve_escalation"
+                | "lemmalog_commit"
         )
     {
         // A discarded save error reports success to the agent while the disk
@@ -893,7 +1170,7 @@ mod tests {
     fn every_tool_schema_lists_only_its_own_properties() {
         let ts = tools();
         let list = ts.as_array().unwrap();
-        assert_eq!(list.len(), 17);
+        assert_eq!(list.len(), 23);
         for t in list {
             let props: Vec<&str> = t["inputSchema"]["properties"]
                 .as_object()
@@ -903,5 +1180,222 @@ mod tests {
                 .collect();
             assert!(!props.is_empty() || t["name"].as_str().unwrap() != "lemmalog_observe");
         }
+    }
+
+    #[test]
+    fn commit_applies_one_evidence_diff() {
+        let mut state = State {
+            memory: AgentMemory::new(lemmalog::agent::MockExtractor::new(0.9), "").unwrap(),
+            path: None,
+        };
+        let first = tool_call(
+            &mut state,
+            "lemmalog_commit",
+            &json!({
+                "actor": "test_adapter",
+                "evidence": "tests:commit",
+                "observe": "claim --status--> proposed"
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(first["isError"], false);
+        assert_eq!(
+            state
+                .memory
+                .ask("current(\"claim\", \"status\", \"proposed\")")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let corrected = tool_call(
+            &mut state,
+            "lemmalog_commit",
+            &json!({
+                "actor": "test_adapter",
+                "evidence": "tests:commit-correction",
+                "retract": "claim --status--> proposed",
+                "observe": "claim --status--> validated"
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(corrected["isError"], false);
+        assert!(state
+            .memory
+            .ask("current(\"claim\", \"status\", \"proposed\")")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            state
+                .memory
+                .ask("current(\"claim\", \"status\", \"validated\")")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn commit_rolls_back_when_observe_is_rejected() {
+        let mut state = State {
+            memory: AgentMemory::new(lemmalog::agent::MockExtractor::new(0.9), "").unwrap(),
+            path: None,
+        };
+        tool_call(
+            &mut state,
+            "lemmalog_commit",
+            &json!({
+                "actor": "test_adapter",
+                "evidence": "tests:rollback-seed",
+                "observe": "claim --status--> proposed"
+            }),
+            None,
+        )
+        .unwrap();
+
+        let failed = tool_call(
+            &mut state,
+            "lemmalog_commit",
+            &json!({
+                "actor": "test_adapter",
+                "evidence": "tests:rollback-invalid-observe",
+                "retract": "claim --status--> proposed",
+                "observe": "this is not line protocol"
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(failed["isError"], true);
+        assert_eq!(
+            state
+                .memory
+                .ask("current(\"claim\", \"status\", \"proposed\")")
+                .unwrap()
+                .len(),
+            1,
+            "the successful retract must be undone when observe is rejected"
+        );
+    }
+
+    #[test]
+    fn snapshot_round_trip_restores_the_engine() {
+        let _guard = GATE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch_dir("engine-gates");
+        set_gate_env(&dir);
+        let mut source = fresh_state();
+        tool_call(
+            &mut source,
+            "lemmalog_observe",
+            &json!({"facts": "snapshot_subject --status--> persisted"}),
+            None,
+        )
+        .unwrap();
+        let bytes = export_snapshot(&source).unwrap();
+
+        let mut restored = fresh_state();
+        restore_snapshot(&mut restored, &bytes).unwrap();
+        assert_eq!(
+            restored
+                .memory
+                .ask("current(\"snapshot_subject\", \"status\", \"persisted\")")
+                .unwrap()
+                .len(),
+            1
+        );
+        clear_gate_env(&dir);
+    }
+
+    fn scratch_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("lemmalog-{label}-{}", std::process::id()))
+    }
+
+    /// The gate directory is process-global (env), so every test that snapshots gate
+    /// state holds this lock and points the paths at scratch dirs — otherwise two
+    /// tests write each other's dirs, and a run would also rewrite the developer's
+    /// real `~/.lemmalog/gate-calibration.jsonl`.
+    static GATE_ENV: Mutex<()> = Mutex::new(());
+
+    fn set_gate_env(dir: &std::path::Path) -> std::path::PathBuf {
+        std::env::set_var("LEMMALOG_GATE_DIR", dir);
+        let calibration = dir.join("calibration.jsonl");
+        std::env::set_var("LEMMALOG_GATE_CALIBRATION", &calibration);
+        calibration
+    }
+
+    fn clear_gate_env(dir: &std::path::Path) {
+        std::env::remove_var("LEMMALOG_GATE_DIR");
+        std::env::remove_var("LEMMALOG_GATE_CALIBRATION");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn fresh_state() -> State {
+        State {
+            memory: AgentMemory::new(lemmalog::agent::MockExtractor::new(0.9), "").unwrap(),
+            path: None,
+        }
+    }
+
+    /// A gate open when the container slept must still be there after the DO replays
+    /// its checkpoint: gate files live on ephemeral container disk, so the blob
+    /// carries them and restore rewrites them.
+    #[test]
+    fn snapshot_round_trip_restores_open_gates() {
+        let _guard = GATE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let source_gates = scratch_dir("source-gates");
+        let restored_gates = scratch_dir("restored-gates");
+        set_gate_env(&source_gates);
+        let mut source = fresh_state();
+        let opened = tool_call(
+            &mut source,
+            "gate_open",
+            &json!({"case": {"id": "mcl-sleep", "artifact": {"claim": "x"}}}),
+            None,
+        )
+        .unwrap();
+        let gate_id = opened["content"][0]["text"]
+            .as_str()
+            .and_then(|t| serde_json::from_str::<J>(t).ok())
+            .and_then(|v| v["gate_id"].as_str().map(str::to_owned))
+            .expect("gate_open returns a gate_id");
+        assert!(source_gates.join(format!("{gate_id}.json")).exists());
+
+        let bytes = export_snapshot(&source).unwrap();
+        // The new container starts with a fresh disk, i.e. an empty gate dir.
+        clear_gate_env(&source_gates);
+        set_gate_env(&restored_gates);
+        let mut restored = fresh_state();
+        restore_snapshot(&mut restored, &bytes).unwrap();
+        assert!(restored_gates.join(format!("{gate_id}.json")).exists());
+        let asked = tool_call(&mut restored, "gate_ask", &json!({"gate_id": gate_id}), None).unwrap();
+        assert_eq!(asked["isError"].as_bool(), Some(false));
+
+        clear_gate_env(&restored_gates);
+    }
+
+    /// Checkpoints written before gates were included are bare engine bytes; they
+    /// must keep restoring, not fail as a corrupt blob.
+    #[test]
+    fn legacy_snapshot_blobs_restore_without_gates() {
+        let mut state = State {
+            memory: AgentMemory::new(lemmalog::agent::MockExtractor::new(0.9), "").unwrap(),
+            path: None,
+        };
+        let legacy = b"engine-bytes-only".to_vec();
+        let (engine, gates) = unpack_snapshot(&legacy).unwrap();
+        assert_eq!(engine, legacy.as_slice());
+        assert!(gates.is_none());
+
+        let packed = pack_snapshot(b"engine", &json!({"sessions": {}, "calibration": null})).unwrap();
+        let (engine, gates) = unpack_snapshot(&packed).unwrap();
+        assert_eq!(engine, b"engine");
+        assert!(gates.unwrap()["sessions"].is_object());
+        assert!(unpack_snapshot(SNAPSHOT_MAGIC).is_err());
+        // A truncated v2 blob must fail loudly rather than drop facts.
+        let mut truncated = pack_snapshot(b"engine", &json!({})).unwrap();
+        truncated.truncate(SNAPSHOT_MAGIC.len() + 2);
+        assert!(unpack_snapshot(&truncated).is_err());
+        assert!(restore_snapshot(&mut state, &truncated).is_err());
     }
 }

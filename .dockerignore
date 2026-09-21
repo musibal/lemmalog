@@ -1,0 +1,8 @@
+.git
+.agents
+.claude
+.goose
+.hermes
+.pi
+target
+*.snapshot

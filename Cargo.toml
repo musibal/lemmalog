@@ -10,8 +10,9 @@ serde_json = { version = "1", optional = true }
 ureq = { version = "2", optional = true }
 
 [[bin]]
-name = "lemmalog-mcp"
-required-features = ["mcp"]
+name = "lemmajevgaun-mcp"
+path = "src/bin/lemmalog-mcp.rs"
+required-features = ["gate"]
 
 [[bin]]
 name = "lemmalog-bench"
@@ -20,6 +21,14 @@ required-features = ["llm"]
 [[bin]]
 name = "lemmalog-cli"
 required-features = ["mcp"]
+
+[[test]]
+name = "jev_test"
+required-features = ["jev"]
+
+[[example]]
+name = "jev_align"
+required-features = ["jev"]
 
 [[example]]
 name = "lmstudio"
@@ -40,3 +49,9 @@ llm = ["dep:ureq", "dep:serde_json"]
 # MCP server binary (Model Context Protocol over stdio) for agent CLIs
 # (Claude Code, Kimi CLI, ...). Needs only serde_json.
 mcp = ["dep:serde_json"]
+# The deployable product: one MCP surface for facts, evidence gates, and JEV.
+gate = ["mcp", "jev"]
+# TypeSafe System One (`jev`): typed questions, calibrated answers. Supplies
+# the confidence the semiring wants and the entity-alignment judgment that
+# `canonical::reconcile` currently asks a text model to write in prose.
+jev = ["dep:ureq", "dep:serde_json"]

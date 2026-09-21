@@ -1,17 +1,12 @@
 ---
-name: lemmalog
+name: lemmajevgaun
 description: >-
-  Externalize working memory and logical state into the lemmalog Datalog
-  engine (MCP). Use for ANY multi-step task where state should outlive one
-  context window or span agents: long investigations, debugging sessions,
-  audits, multi-agent searches, systematic explorations, planning with many
-  interdependent constraints, anything needing provenance for its
-  conclusions. Trigger when lemmalog_ MCP tools are available and the task
-  involves accumulating verified facts, tracking hypotheses or status over
-  time, or repeatedly re-deriving the same relationships.
+  The one MCP product for Lemmalog evidence and derivation, a fail-closed
+  gate, bounded Gauntlet Loop, and JEV multi-question judgments. Use for
+  durable investigations and decisions that need auditable evidence.
 ---
 
-# Lemmalog — external working memory
+# lemmajevgaun — evidence, gate, Gauntlet, JEV
 
 `lemmalog` is a Datalog engine exposed as MCP tools. It is your working
 memory: assertions with provenance and confidence, derived consequences
@@ -23,35 +18,33 @@ perception and choice; every choice's outcome returns to the engine.
 A claim that isn't in the engine doesn't exist — nothing durable lives in
 your context.
 
-## Setup
+## One deployment, one MCP, one skill
 
-- The `lemmalog_*` tools must be registered (see the README of the
-  lemmalog repo). If they are absent, tell the user the one-line
-  registration command and continue without memory — never block the task.
-- Persistence across sessions exists if `LEMMALOG_MCP_PATH` was set at
-  registration; `lemmalog_save` forces a snapshot. Snapshots carry rule
-  batches too — installed analyses survive restarts under their batch ids.
-- No MCP access (sub-agents that don't inherit MCP connections, scripts,
-  cron)? `lemmalog-cli` works on the SAME snapshot:
-  `LEMMALOG_MCP_PATH=... lemmalog-cli observe --facts 'S --rel--> O'`,
-  plus query/retract/context/why/rules/dump. Mutations are visible to
-  the MCP server on its next load and vice versa — but the two hold
-  separate in-process copies, so don't write from both at once: hand
-  sub-agents the CLI and keep the parent on it too, or have the parent
-  only read while a sub-agent writes.
+`lemmajevgaun` is a single Docker service. It exposes the same HTTP MCP
+endpoint to Musibañ Cloudflare, Sayago, and local development. Do not register
+Lemmalog and Gatepack separately. Do not run a launchd daemon or a second
+snapshot writer.
+
+```bash
+docker compose up -d --build
+```
+
+The local endpoint is `http://127.0.0.1:8765/mcp`. Containers on the same
+Docker network use `http://lemmajevgaun:8765/mcp`. Persisted facts, gate
+sessions, and calibration are in the Docker volume. Supply `TYPESAFE_API_KEY`
+to the container; approved Gauntlet builders are the server-side JSON map
+`LEMMALOG_GAUNTLET_BUILDERS_JSON`, never a command supplied by an MCP caller.
 
 ## The discipline
 
-1. **Assert as you verify.** The moment you confirm something — a call
-   edge, a config value, a decision, a step completed — assert it:
-   `S --rel[conf]--> O`. Tag read-and-verified facts `[1.0]` and inferences
-   `[0.4]`–`[0.7]`. Do not omit the tag on anything you expect to derive over:
-   the default is 0.9 and confidence is a product down the proof chain, so four
-   hops of "verified" facts land at 0.66 and a deep closure decays to noise.
-   Anchor evidence with `located(Entity, "file:line")` (or any stable
-   reference) so provenance survives derivation — source references are valid
-   entity tokens as long as they contain no spaces. Never assert what you
-   haven't checked.
+1. **Commit verified evidence atomically.** The agent/domain adapter turns
+   confirmed sources into one semantic diff and calls
+   `lemmalog_commit({ actor, evidence, observe?, retract?, ts? })`. Use an
+   evidence reference for every diff, tag read-and-verified facts `[1.0]` and
+   inferences `[0.4]`–`[0.7]`, and anchor sources with
+   `located(Entity, "file:line")` (or another stable reference). Never call
+   naked `lemmalog_observe` or `lemmalog_retract` in a normal agent flow, and
+   never commit an unverified claim.
 2. **Install rules when a pattern repeats.** If you ask the same shape of
    question twice, write the Datalog for it: transitive closures, guard
    tracking, status rollups, `count`/`min`/`max`/`sum` aggregates. Rules
@@ -77,13 +70,13 @@ your context.
    `H --evidence--> ref` (accumulates).
    Test counterfactuals with `lemmalog_what_if` — temporary facts,
    answered goal, store untouched.
-6. **Correct by retracting.** When you learn an asserted fact was
-   wrong — not changed, wrong — `lemmalog_retract` it: the response
-   lists every derived conclusion that died with it, so the repair is
-   visible, not silent. (A value that merely changed is re-asserted
-   under the same relation; see "State that changes".) After a context
-   reset or another agent's turn, `lemmalog_changes` with your last
-   epoch resyncs you without re-reading the store.
+6. **Correct in the same evidence diff.** When an asserted fact is
+   wrong — not merely changed — include its retraction and replacement (if
+   any) in one `lemmalog_commit`; it validates, derives, and persists once.
+   A value that merely changed is re-asserted under the same relation; see
+   "State that changes". After a context reset or another agent's turn,
+   `lemmalog_changes` with your last epoch resyncs you without re-reading the
+   store.
 7. **Reconcile vocabulary, don't enforce it.** Name things naturally;
    when two names mean one thing, `local --alias_of[conf]--> canonical`
    via `lemmalog_canonicalize`. Conflicts surface as `alias_conflict`
@@ -96,6 +89,32 @@ your context.
    `why` trees, not from memory. A conclusion's confidence is the product
    of its edges (the engine multiplies down the proof chain) — deep
    derivations need high-confidence inputs to stay believable.
+
+## The decision pipeline
+
+For a decision, do not call JEV by itself. Use these five MCP verbs in order:
+
+1. `gate_open(case, evidence_refs)` receives one complete, compact atomic case
+   `{ "id": "...", "artifact": { ... } }` and refs of the form
+   `subject|relation|object`. Include the decision, constraints, acceptance
+   checks, and cited evidence — not an issue transcript or unrelated history.
+   It resolves every ref against the in-process Lemmalog engine.
+2. `gate_ask(gate_id)` returns only unresolved or stale evidence questions.
+3. `gate_answer(gate_id, ref)` re-resolves one declared ref. It never accepts
+   caller-provided evidence.
+4. `gate_decide(gate_id, builder, max_cycles)` injects both resolved and
+   unresolved rows into the artifact and runs at most two Gauntlet revisions.
+   Each cycle makes **one JEV request with the complete atomic state** and the
+   complementary question cart: verdict, failed dimension, next action,
+   scope, evidence, acceptance, and safety. JEV proposes; it never writes
+   facts or executes business effects.
+5. `gate_outcome(gate_id, was_correct, defect, evidence)` appends the observed
+   result to the calibration ledger.
+
+Hard rules only lower a result. Missing, stale, or unresolved evidence and a
+`needs_work` dimension cap `pass` at `human_review`. A resolved `dead_end`
+also requires review. The gate returns `facts_to_assert`; verify them and include them in a source-backed
+`lemmalog_commit` if they are true.
 
 ## Schema conventions
 
@@ -191,8 +210,9 @@ Stays in your head: in-flight reading, semantic judgment.
 Must land in the engine: conclusions, state changes, decisions — before
 you move on — and dead ends most of all: a searched-and-ruled-out
 avenue is the most valuable thing a future agent can inherit (`X
---dead_end--> why it failed, where confirmed`). Assert them in bulk —
-one observe call, one line each; fifty at once is fine.
+--dead_end--> why it failed, where confirmed`). Send one evidence-backed
+semantic diff through `lemmalog_commit`; it is the single validation,
+derivation, and persistence boundary.
 
 Scope honesty: for a short task that fits one context window, working
 memory in your head is cheaper — lemmalog pays when state must outlive

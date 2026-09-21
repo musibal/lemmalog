@@ -444,15 +444,17 @@ impl Retrieval {
             fact_lines.push((self.facts[*i].render.clone(), *s));
         }
 
-        // episodes: provenance of selected facts, then BM25 relevance
+        // Include only provenance episodes or episodes with an actual lexical
+        // match. Zero-score episodes are unrelated memory noise.
         let ep_scores = self.ep_bm25.scores(query);
         let mut ep_ranked: Vec<(usize, f64, bool)> = self
             .episodes
             .iter()
             .enumerate()
-            .map(|(i, ep)| {
+            .filter_map(|(i, ep)| {
+                let score = ep_scores.get(i).copied().unwrap_or(0.0);
                 let prov = wanted_eps.contains(&ep.id);
-                (i, ep_scores.get(i).copied().unwrap_or(0.0), prov)
+                (prov || score > 0.0).then_some((i, score, prov))
             })
             .collect();
         ep_ranked.sort_by(|a, b| {

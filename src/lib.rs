@@ -30,6 +30,10 @@ pub mod ast;
 pub mod canonical;
 pub mod eval;
 pub mod intern;
+#[cfg(feature = "jev")]
+pub mod jev;
+#[cfg(feature = "gate")]
+pub mod gate;
 #[cfg(feature = "llm")]
 pub mod llm;
 #[cfg(feature = "llm")]

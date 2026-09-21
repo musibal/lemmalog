@@ -1,10 +1,9 @@
 {
   "mcpServers": {
-    "lemmalog": {
-      "command": "/absolute/path/to/target/release/lemmalog-mcp",
-      "env": {
-        "LEMMALOG_MCP_PATH": "/absolute/path/to/memory.snapshot"
-      }
+    "lemmajevgaun": {
+      "type": "http",
+      "url": "http://lemmajevgaun:8765/mcp",
+      "callTimeoutMs": 300000
     }
   }
 }

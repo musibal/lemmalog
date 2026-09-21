@@ -76,6 +76,38 @@ epoch. A similarity-gated LLM reconciliation pass
 (`canonical::reconcile::reconcile_entities`) offers only
 embedding-similar name pairs to the model.
 
+### Calibrated alignment (`--features jev`)
+
+`canonical::jev_align` does the same job through TypeSafe System One
+(`src/jev.rs`), which answers typed questions instead of generating prose.
+The difference that matters is the number: `reconcile_entities` parses a
+confidence out of a line of text (defaulting to 0.8 when the model omits
+it), whereas a `Score` answer carries a confidence derived from the
+probability distribution. The engine multiplies these down proof chains,
+so an invented 0.8 and a measured 0.41 are not interchangeable.
+
+It also has somewhere to put the hard cases. `reconcile_entities` can only
+alias or skip; here each pair routes to `Merge`, `Curator`, or `Leave`,
+and a high score the model is *not* confident about goes to the curator
+rather than being asserted — merging wrongly is the expensive mistake.
+
+```bash
+# one pair per line, `a<TAB>b`
+TYPESAFE_API_KEY=... cargo run --features jev --example jev_align < pairs.tsv
+# or a plain name list: candidate_pairs gates it first
+JEV_MIN_JACCARD=0.5 TYPESAFE_API_KEY=... \
+  cargo run --features jev --example jev_align < relations.txt
+```
+
+One call per pair is mandatory — batching independent states moves scores
+by up to 0.73, because the other pairs act as distractors — so the pair
+count is the bill. `jev_align::candidate_pairs` gates it on token overlap:
+on a real vocabulary of 2,285 relation names, all-pairs is 2,609,470 calls
+and `min_jaccard` 0.5 leaves 653. The gate deliberately over-proposes
+(`paso_5` and `paso_6` reduce to one token and score 1.0) because
+rejecting those is what the calibrated half is for — lexical similarity
+and jev's verdict correlate at 0.16 on real pairs.
+
 Building this surfaced and fixed two long-lived engine bugs: the scoped
 recompute never processed same-stratum dependents (latent stale-fact
 bug), fixed by SCC-condensation stratification plus a recompute
@@ -104,84 +136,39 @@ mkdir -p ~/.claude/skills && cp -r skills/lemmalog ~/.claude/skills/
 
 Task prompts then stay domain-specific and reference the skill in one line.
 
-## MCP server: use from Claude Code or Kimi CLI
+## lemmajevgaun: one Docker MCP for Musibañ, Sayago, and local development
 
-```sh
-cargo build --release --features mcp
+`lemmajevgaun` is the deployable product. It combines Lemmalog's deterministic
+facts and provenance, the fail-closed evidence gate, a bounded Gauntlet Loop,
+and a single multi-question JEV judgment per loop cycle. It is one HTTP MCP
+endpoint, not a Lemmalog MCP plus a Gatepack MCP.
+
+```bash
+TYPESAFE_API_KEY=... docker compose up -d --build
 ```
 
-Register the server (stdio JSON-RPC, 12 tools):
+Use `http://host.docker.internal:8765/mcp` from the separate Musibañ
+Cloudflare and Sayago Docker MCP containers on Docker Desktop. If a consumer
+joins this Compose network, use `http://lemmajevgaun:8765/mcp`; use
+`http://127.0.0.1:8765/mcp` only from this Mac. The Docker volume owns
+the snapshot, gate sessions, and calibration ledger. Do not use launchd or a
+local second writer. `gate_decide` accepts only a builder ID defined by
+`LEMMALOG_GAUNTLET_BUILDERS_JSON`; untrusted callers cannot supply shell
+commands.
 
-```sh
-# Claude Code (project or user scope)
-claude mcp add lemmalog -- $(pwd)/target/release/lemmalog-mcp
+## MCP contract
 
-# Kimi CLI
-kimi mcp add lemmalog -- $(pwd)/target/release/lemmalog-mcp
+There is one server identity: `lemmajevgaun`. Register one HTTP connection:
+
+```json
+{"lemmajevgaun":{"type":"http","url":"http://lemmajevgaun:8765/mcp","callTimeoutMs":300000}}
 ```
 
-Or the one-command installer (builds, registers the MCP server with
-every supported CLI it finds, installs the skill):
-
-```sh
-./scripts/install.sh               # install
-./scripts/install.sh --uninstall   # remove registrations + skill
-```
-
-Memory persists at `$LEMMALOG_SNAPSHOT` (default `~/.lemmalog/memory.snap`).
-
-Persistence across sessions: set the environment when registering
-(both CLIs support `--env KEY=VALUE` on add):
-
-```sh
-claude mcp add lemmalog --env LEMMALOG_MCP_PATH=/tmp/lemmalog.snapshot -- \
-  $(pwd)/target/release/lemmalog-mcp
-```
-
-**Sub-agents that can't reach MCP** (Kimi CLI sub-agents need
-`mcp__lemmalog__*` in their agent profile's `tools` list — the bare
-`mcp__lemmalog` form matches nothing) and scripts/cron can use the
-headless CLI on the same snapshot:
-
-```sh
-LEMMALOG_MCP_PATH=/tmp/lemmalog.snapshot lemmalog-cli observe --facts 'S --rel--> O'
-LEMMALOG_MCP_PATH=/tmp/lemmalog.snapshot lemmalog-cli query --goal 'current("s", R, O)'
-```
-
-Mutations are visible to the MCP server on its next load and vice
-versa; the two hold separate in-process copies, so don't write from
-both simultaneously (have the parent read while a sub-agent writes, or
-route every writer through the CLI).
-
-The intended division of labor: the host model (Claude/Kimi) reads the
-conversation and asserts triples via `lemmalog_observe` (line protocol
-`S --rel[conf]--> O`); Lemmalog derives closures, temporal views,
-canonicalizations and aggregations deterministically. Typical session:
-
-```
-lemmalog_observe      {"facts": "Alice --works_at--> Acme\nAlice --manager--> Bob", "ts": 100}
-lemmalog_install_rules {"rules": "reports_to(X,Y) :- current(X,\"manager\",Y).\n trans: ..."}
-lemmalog_query        {"goal": "reports_to(\"Alice\", Y)"}        -> Y=Bob, Y=Carol
-lemmalog_why          {"fact": "reports_to(Alice, Carol)"}          -> proof tree to episodes
-lemmalog_what_if      {"facts": "Dana --manager--> Alice", "goal": "reports_to(\"Dana\", Y)"}
-lemmalog_canonicalize {"facts": "Acme_Corp --alias_of[0.9]--> Acme"}
-```
-
-Also available: `lemmalog_query_deep` (magic sets), `lemmalog_dump`,
-`lemmalog_batches`/`lemmalog_uninstall` (revertable rule batches),
-`lemmalog_save`, `lemmalog_run`. Note the goal/fact grammar: bare
-capitalized words are variables — quote entity names
-(`reports_to("Alice", Y)`).
-
-**Error semantics are built for self-correction.** Recoverable input
-errors (unparseable goals, rejected rule batches, unknown batch ids)
-return as tool results with `isError: true` — category prefix, the
-offending input, the precise reason, and a hint or corrected example
-(e.g. the quote-entity-names hint on every parse failure). Silent
-zero-fact ingestion is impossible: `lemmalog_observe` reports every
-dropped line with its reason (pronoun/role-word subjects, prose
-contamination, missing `--rel-->` structure), so a malformed extraction
-batch is loud, not lost.
+For local development use the same shape with `127.0.0.1`. `tools/list`
+contains Lemmalog's evidence tools plus `gate_open`, `gate_ask`,
+`gate_answer`, `gate_decide`, and `gate_outcome`. The latter are the only
+way to advance a governed decision. The container is the only snapshot
+writer; scripts and agents must use MCP, not `lemmalog-cli` on its volume.
 
 ## LongMemEval (oracle split) — live results
 

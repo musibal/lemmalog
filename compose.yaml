@@ -1,0 +1,20 @@
+services:
+  lemmajevgaun:
+    build: .
+    image: lemmajevgaun:local
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:?set TYPESAFE_API_KEY}
+      # Builder IDs, not caller-provided shell commands. Example:
+      # LEMMALOG_GAUNTLET_BUILDERS_JSON: '{"artifact-reviser":"/app/revise"}'
+      LEMMALOG_GAUNTLET_BUILDERS_JSON: ${LEMMALOG_GAUNTLET_BUILDERS_JSON:-{}}
+      LEMMALOG_MCP_PATH: /data/lemmalog-memory.snapshot
+    mem_limit: 14g
+    memswap_limit: 14g
+    restart: unless-stopped
+    # Store del host: sobrevive a resets de la VM de Docker Desktop.
+    # user 501 (pere) para poder escribir el snapshot con permisos del host.
+    user: "501:20"
+    volumes:
+      - /Users/pere/.lemmalog:/data

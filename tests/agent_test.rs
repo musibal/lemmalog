@@ -1,4 +1,7 @@
-use lemmalog::{canonical::{assert_alias, install_canonicalization}, AgentMemory, MockExtractor, Value};
+use lemmalog::{
+    canonical::{assert_alias, install_canonicalization},
+    AgentMemory, MockExtractor, Value,
+};
 
 fn mem(extra: &str) -> AgentMemory<MockExtractor> {
     AgentMemory::new(MockExtractor::new(0.9), extra).unwrap()
@@ -74,7 +77,11 @@ fn declared_multi_accumulates_without_escalating() {
     m.observe("fallo --causa--> disco_lleno");
     let r = m.observe("fallo --causa--> reloj_desfasado");
     assert_eq!(r.added, 1);
-    assert!(r.escalations.is_empty(), "declared multi must not escalate: {:?}", r.escalations);
+    assert!(
+        r.escalations.is_empty(),
+        "declared multi must not escalate: {:?}",
+        r.escalations
+    );
     m.maintain(100);
     assert_eq!(m.ask("current(\"fallo\", \"causa\", O)").unwrap().len(), 2);
 }
@@ -87,7 +94,10 @@ fn explicit_policy_overrides_builtin_relation_lists() {
     let report = m.observe_at("doc --located--> second", 200);
     assert!(report.escalations.is_empty(), "{report:?}");
     m.maintain(200);
-    assert_eq!(m.ask("current(\"doc\", \"located\", O)").unwrap(), vec!["O=second".to_string()]);
+    assert_eq!(
+        m.ask("current(\"doc\", \"located\", O)").unwrap(),
+        vec!["O=second".to_string()]
+    );
 
     let mut m = mem("multi(\"status\").");
     m.maintain(1);
@@ -427,6 +437,74 @@ fn punctuation_with_spaces_is_still_prose() {
 }
 
 #[test]
+fn advisories_warn_without_dropping_the_fact() {
+    use lemmalog::agent::{fact_advisories, parse_protocol_reported, payload_ratio};
+    // underscore-joined prose: the strict validator only inspects tokens
+    // containing whitespace, so this slips past it and IS asserted
+    const BATCH: &str = "of5f_circuito --medido--> 26_de_1108_con_predicado_estricto_clase_administrativa_excluida\n\
+         gate_1509 --verificado_1509--> ok\n\
+         plantilla_prl --no_existe--> en_portal\n\
+         x --alias_of--> canon\n\
+         gate_supercov --located--> scripts/supercov_gate.py:1\n\
+         realdecreto --deroga--> real_decreto_legislativo_1_1992";
+    let (facts, dropped) = parse_protocol_reported(BATCH, 1.0);
+    assert!(
+        dropped.is_empty(),
+        "advisories must never drop: {dropped:?}"
+    );
+    assert_eq!(facts.len(), 6, "every line must still be asserted");
+
+    let adv = fact_advisories(&facts);
+    let why = |pred: &str| {
+        adv.iter()
+            .find(|(l, _)| l.contains(pred))
+            .map(|(_, a)| a.clone())
+            .unwrap_or_else(|| panic!("no advisory for {pred}: {adv:?}"))
+    };
+    assert!(why("verificado_1509").contains("date"), "{adv:?}");
+    assert!(why("no_existe").contains("negation"), "{adv:?}");
+    assert!(why("alias_of").contains("INERT"), "{adv:?}");
+
+    // The prose signal is a RATIO, never a per-line verdict: `dead_end`,
+    // `hypothesis`, `decision` and `causa` all mandate a phrase as object.
+    let (prose, total) = payload_ratio(&facts);
+    assert_eq!(total, 6);
+    assert_eq!(prose, 1, "only the payload-bearing object counts: {adv:?}");
+    // And the by-design exemptions really are exempt.
+    let (none, _) = payload_ratio(
+        &parse_protocol_reported(
+            "x --dead_end--> buscado_en_tres_sitios_y_no_existe_en_ninguno_de_ellos\n\
+         y --hypothesis--> el_cron_dispara_antes_de_que_llegue_el_dato_de_oficina",
+            1.0,
+        )
+        .0,
+    );
+    assert_eq!(none, 0, "prose-by-contract must not be flagged");
+
+    // The false-positive guards: a source anchor is a reference, not
+    // payload, and a long-but-legitimate underscore name is not prose.
+    let flagged: Vec<&str> = adv.iter().map(|(l, _)| l.as_str()).collect();
+    assert!(
+        !flagged.iter().any(|l| l.starts_with("gate_supercov")),
+        "a source anchor must not be flagged: {adv:?}"
+    );
+    assert!(
+        !flagged.iter().any(|l| l.contains("realdecreto")),
+        "a short-underscore name must not be flagged: {adv:?}"
+    );
+
+    // And the real ingest path must behave the same: the advisories travel
+    // on the report, the facts still land. Without this the test title is a
+    // claim about a path it never exercises.
+    let mut m = mem("");
+    let (report, dropped) = m.observe_extracted(BATCH, 100);
+    assert!(dropped.is_empty(), "ingest must not drop: {dropped:?}");
+    assert_eq!(report.added, 6, "every advised fact must still be stored");
+    assert_eq!(report.advisories.len(), adv.len());
+    assert_eq!(report.payload, (1, 6));
+}
+
+#[test]
 fn snapshot_preserves_rules_installed_after_construction() {
     let dir = std::env::temp_dir().join("lemmalog-test-batches");
     std::fs::create_dir_all(&dir).unwrap();
@@ -536,7 +614,6 @@ fn retract_propagates_through_derived_closures() {
     assert_eq!(missing2.len(), 1);
 }
 
-
 #[test]
 fn retract_facts_accepts_alias_and_reports_dead_canonical_views() {
     let mut m = mem("");
@@ -546,30 +623,60 @@ fn retract_facts_accepts_alias_and_reports_dead_canonical_views() {
     assert_alias(&mut m.engine, "local", "canonical", 0.9);
     assert_alias(&mut m.engine, "local", "canonical_two", 0.9);
     m.engine.run();
-    assert_eq!(m.ask("current_canon(\"canonical\", \"color\", \"blue\")").unwrap().len(), 1);
-    assert_eq!(m.ask("current_canon(\"canonical_two\", \"color\", \"blue\")").unwrap().len(), 1);
+    assert_eq!(
+        m.ask("current_canon(\"canonical\", \"color\", \"blue\")")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        m.ask("current_canon(\"canonical_two\", \"color\", \"blue\")")
+            .unwrap()
+            .len(),
+        1
+    );
 
     let (done, missing, died) = m.retract_facts("local --alias--> canonical");
     assert!(missing.is_empty(), "{missing:?}");
     assert_eq!(done, vec!["local --alias--> canonical"]);
-    assert!(died.iter().any(|line| line.contains("current_canon")), "{died:?}");
-    assert!(m.ask("current_canon(\"canonical\", \"color\", \"blue\")").unwrap().is_empty());
-    assert_eq!(m.ask("current_canon(\"canonical_two\", \"color\", \"blue\")").unwrap().len(), 1);
+    assert!(
+        died.iter().any(|line| line.contains("current_canon")),
+        "{died:?}"
+    );
+    assert!(m
+        .ask("current_canon(\"canonical\", \"color\", \"blue\")")
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        m.ask("current_canon(\"canonical_two\", \"color\", \"blue\")")
+            .unwrap()
+            .len(),
+        1
+    );
 
     let (done, missing, _) = m.retract_facts("local --alias_of--> canonical_two");
     assert!(missing.is_empty(), "{missing:?}");
     assert_eq!(done, vec!["local --alias_of--> canonical_two"]);
-    assert!(m.ask("current_canon(\"canonical_two\", \"color\", \"blue\")").unwrap().is_empty());
+    assert!(m
+        .ask("current_canon(\"canonical_two\", \"color\", \"blue\")")
+        .unwrap()
+        .is_empty());
     let (done, missing, died) = m.retract_facts("local --alias--> canonical_two");
     assert!(done.is_empty() && died.is_empty());
     assert_eq!(missing, vec!["local --alias--> canonical_two"]);
 
-    let path = std::env::temp_dir().join(format!("lemmalog-test-retract-alias-{}.snapshot", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "lemmalog-test-retract-alias-{}.snapshot",
+        std::process::id()
+    ));
     let path = path.to_str().unwrap();
     m.save(path).unwrap();
     let loaded = AgentMemory::load(MockExtractor::new(0.9), path).unwrap();
     assert!(loaded.engine.query("alias", &[None, None]).is_empty());
-    assert!(loaded.ask("current_canon(\"canonical\", \"color\", \"blue\")").unwrap().is_empty());
+    assert!(loaded
+        .ask("current_canon(\"canonical\", \"color\", \"blue\")")
+        .unwrap()
+        .is_empty());
     let _ = std::fs::remove_file(path);
 }
 
@@ -584,8 +691,15 @@ fn canonical_views_refresh_incrementally_for_new_current_facts() {
 
     m.observe_extracted("local --zz_rel--> cosa_uno", 200);
     m.maintain(200);
-    assert_eq!(m.ask("current(\"local\", \"zz_rel\", X)").unwrap(), vec!["X=cosa_uno".to_string()]);
-    assert_eq!(m.ask("current_canon(\"canonical\", \"zz_rel\", X)").unwrap(), vec!["X=cosa_uno".to_string()]);
+    assert_eq!(
+        m.ask("current(\"local\", \"zz_rel\", X)").unwrap(),
+        vec!["X=cosa_uno".to_string()]
+    );
+    assert_eq!(
+        m.ask("current_canon(\"canonical\", \"zz_rel\", X)")
+            .unwrap(),
+        vec!["X=cosa_uno".to_string()]
+    );
 }
 
 #[test]
@@ -608,6 +722,93 @@ fn rich_context_carries_attribution_and_latest_values() {
     assert!(
         ctx2.contains("superseded: landscapes") || ctx2.contains("paints"),
         "{ctx2}"
+    );
+}
+
+#[test]
+fn current_state_triggers_on_spanish_questions_too() {
+    // The section's trigger words used to be English-only (current, latest,
+    // amount, price, value): a store whose facts and questions are written
+    // as often in Spanish as English got the dumb path on "cual es el
+    // estado actual" while "what is the current state" worked.
+    let mut m = AgentMemory::<MockExtractor>::new(MockExtractor::new(0.9), "").unwrap();
+    m.observe_extracted("estado_obra --estado--> pendiente", 100);
+    m.observe_extracted("estado_obra --estado--> confirmado", 200);
+    m.maintain(200);
+    let ctx = m.context_for_query_rich("cual es el estado actual de estado_obra?", 400);
+    assert!(ctx.contains("CURRENT STATE"), "{ctx}");
+    assert!(ctx.contains("superseded: pendiente"), "{ctx}");
+}
+
+#[test]
+fn attribution_and_current_state_are_capped_to_the_caller_budget() {
+    // Both appended sections were cut at a fixed LINE count (6, 8), never
+    // against `budget_tokens` — a caller asking for a small budget could
+    // still get a payload several times its size. Build enough distinct
+    // slots to make the uncapped section exceed a tiny budget, then check
+    // the returned text respects it.
+    let mut m = AgentMemory::<MockExtractor>::new(MockExtractor::new(0.9), "").unwrap();
+    for i in 0..8 {
+        let subj = format!("estado_obra_{i}");
+        m.observe_extracted(
+            &format!("{subj} --estado--> valor_inicial_de_prueba_larga"),
+            100,
+        );
+        m.observe_extracted(
+            &format!("{subj} --estado--> valor_final_confirmado_extenso"),
+            200,
+        );
+    }
+    m.maintain(200);
+    let budget_tokens = 20; // 80 bytes hard cap
+    let ctx = m.context_for_query_rich("estado actual de estado_obra?", budget_tokens);
+    assert!(
+        ctx.len() <= budget_tokens * 4 + 64,
+        "context of {} bytes exceeds the {budget_tokens}-token budget by more than the \
+         truncation marker's own size:\n{ctx}",
+        ctx.len()
+    );
+}
+
+#[test]
+fn an_out_of_domain_question_retrieves_nothing() {
+    // The audit's negative control, as a regression: a question whose
+    // domain has ZERO tokens in the store used to come back with 48
+    // confidently-ranked lines and 0 relevant ones, because entity
+    // matching was raw `contains` — `es` matched inside `eolicas`,
+    // `proto` inside `protocolo` — and each hit bought the full direct
+    // boost. A memory that cannot say "nothing here" answers false
+    // premises with fluent noise.
+    let mut m = AgentMemory::<MockExtractor>::new(MockExtractor::new(0.9), "").unwrap();
+    // One fact per episode: a shared episode gets dragged in verbatim as
+    // provenance by ANY match inside it, which would mask the thing under
+    // test (fact selection) behind episode selection.
+    m.observe_extracted("caroline --received_necklace_from--> grandma", 100);
+    m.observe_extracted("melanie --paints--> landscapes", 110);
+    // The discriminating fixture: `proto` is a SUBSTRING of the question's
+    // word `protocolo` but never a whole token in it. Under raw `contains`
+    // it matched and bought the full direct boost, dragging `barco` into
+    // an answer about wind turbines; under word-boundary matching it does
+    // not. Without this entity the test passes either way and proves
+    // nothing.
+    m.observe_extracted("proto --owns--> barco", 120);
+    m.maintain(120);
+
+    let ctx = m.context_for_query_rich(
+        "protocolo de mantenimiento de turbinas eolicas offshore",
+        400,
+    );
+    assert!(
+        !ctx.contains("barco"),
+        "a substring-only entity match must not drag its facts in:\n{ctx}"
+    );
+
+    // Control in the other direction: a question that IS in the store
+    // still retrieves. The fix must narrow false positives, not recall.
+    let hit = m.context_for_query_rich("what did caroline receive from grandma?", 400);
+    assert!(
+        hit.contains("caroline"),
+        "an in-domain question must still retrieve:\n{hit}"
     );
 }
 
@@ -683,7 +884,6 @@ fn quoted_objects_parse_to_clean_symbols() {
     assert!(lemmalog::agent::parse_protocol_strict(bad, 0.9).is_empty());
 }
 
-
 #[test]
 fn ts_less_observe_lands_on_wall_clock_not_logical_clock() {
     // Regression: the logical clock starts at 0, so a ts-less observe used
@@ -695,13 +895,15 @@ fn ts_less_observe_lands_on_wall_clock_not_logical_clock() {
         .unwrap()
         .as_secs() as i64;
     let t = m.ts_or_wall_clock(None);
-    assert!(t >= wall, "ts-less default {t} is behind the wall clock {wall}");
+    assert!(
+        t >= wall,
+        "ts-less default {t} is behind the wall clock {wall}"
+    );
     // an explicit ts still wins, and the clock never runs backwards
     assert_eq!(m.ts_or_wall_clock(Some(42)), 42);
     m.observe_extracted("alice --works_at--> acme", t);
     assert!(m.ts_or_wall_clock(None) >= t);
 }
-
 
 #[test]
 fn snapshot_omits_aggregate_scratch_relations() {
@@ -753,10 +955,18 @@ fn reasserting_the_survivor_closes_stale_siblings_of_an_exclusive_slot() {
     let mut m = mem("");
     m.observe_at("worker --sabor--> a", 100);
     let r = m.observe_at("worker --sabor--> b", 110);
-    assert_eq!(r.escalations.len(), 1, "sin exclusive todavia: conflicto en cola");
+    assert_eq!(
+        r.escalations.len(),
+        1,
+        "sin exclusive todavia: conflicto en cola"
+    );
     m.install_rules("exclusive(\"sabor\").").unwrap();
     m.maintain(150);
-    assert_eq!(m.ask("current(\"worker\", \"sabor\", O)").unwrap().len(), 2, "el doble sigue abierto");
+    assert_eq!(
+        m.ask("current(\"worker\", \"sabor\", O)").unwrap().len(),
+        2,
+        "el doble sigue abierto"
+    );
     let r = m.observe_at("worker --sabor--> a", 200);
     assert_eq!(r.updated, 1, "re-afirmar la buena cierra la obsoleta");
     assert!(r.escalations.is_empty());
@@ -838,7 +1048,10 @@ fn load_folds_a_per_value_queue_into_one_line_per_slot() {
         kept.contains("fix: lemmalog_install_rules with `multi(\"sabor\").`"),
         "el remedio viaja con la linea: {kept}"
     );
-    assert!(!kept.contains("ep1, but"), "la vieja se pliega, no se copia: {kept}");
+    assert!(
+        !kept.contains("ep1, but"),
+        "la vieja se pliega, no se copia: {kept}"
+    );
 }
 
 #[test]
@@ -848,13 +1061,19 @@ fn underscore_prefixed_variables_parse_as_variables() {
     let mut m = AgentMemory::<MockExtractor>::new(MockExtractor::new(0.9), "").unwrap();
     m.observe_extracted("n0 --requires--> m0\nn1 --requires--> m1", 100);
     m.maintain(100);
-    m.install_rules("interior(X) :- current(X, \"requires\", _Y).").unwrap();
+    m.install_rules("interior(X) :- current(X, \"requires\", _Y).")
+        .unwrap();
     m.maintain(100);
     assert_eq!(m.ask("interior(X)").unwrap().len(), 2, "_Y is a variable");
-    m.install_rules("tagged(X) :- current(X, \"requires\", _foo).").unwrap();
+    m.install_rules("tagged(X) :- current(X, \"requires\", _foo).")
+        .unwrap();
     m.maintain(100);
     // `_foo` is a constant that matches nothing: still derives nothing
-    assert_eq!(m.ask("tagged(X)").unwrap().len(), 0, "_foo stays a constant");
+    assert_eq!(
+        m.ask("tagged(X)").unwrap().len(),
+        0,
+        "_foo stays a constant"
+    );
 }
 
 #[test]
@@ -864,13 +1083,18 @@ fn installing_a_shadow_rule_warns_about_union() {
     let mut m = AgentMemory::<MockExtractor>::new(MockExtractor::new(0.9), "").unwrap();
     m.observe_extracted("n0 --requires--> m0", 100);
     m.maintain(100);
-    let b1 = m.install_rules("dep(A, B) :- current(A, \"requires\", B).").unwrap();
+    let b1 = m
+        .install_rules("dep(A, B) :- current(A, \"requires\", B).")
+        .unwrap();
     assert!(m.batch_conflicts(&b1).is_empty(), "first install is clean");
     let b2 = m
         .install_rules("dep(A, B) :- current(A, \"requires\", B), current(A, \"keep\", yes).")
         .unwrap();
     let warns = m.batch_conflicts(&b2);
     assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].contains("dep is also defined by batch(es) b"), "{warns:?}");
+    assert!(
+        warns[0].contains("dep is also defined by batch(es) b"),
+        "{warns:?}"
+    );
     assert!(warns[0].contains("UNION"), "{warns:?}");
 }

@@ -139,6 +139,192 @@ fn valid_entity_token(s: &str) -> bool {
     entity_token_problem(s).is_none()
 }
 
+/// Advisory (NEVER blocking) quality problems: the fact is asserted, but
+/// the engine will not be able to reason over it. Separate from
+/// [`entity_token_problem`], which drops — losing a true fact costs more
+/// than storing a badly-named one, so these only warn.
+///
+/// The strict validator only inspects tokens that contain WHITESPACE, so
+/// underscore-joined prose slips past it. Measured on the shared store
+/// (2026-09-22): 4906 of 16141 knowledge objects (30.4%) carry 8+
+/// underscore segments, while only 5.7% of objects are a bare integer or
+/// date the engine can aggregate or order. That is the payload-in-the-object
+/// habit, and it is why relation vocabulary exploded to 5970 names for
+/// 23180 facts.
+pub fn fact_advisory(f: &CandidateFact) -> Option<String> {
+    // `alias_of` through observe lands as an ordinary edge: only
+    // `canonicalize` writes the alias table that retrieval's union-find and
+    // the alias_conflict rules read. Worse, retract treats `alias_of` as
+    // that table, so such an edge cannot even be removed afterwards.
+    if f.pred == "alias_of" {
+        return Some(
+            "`alias_of` asserted through observe is INERT — it becomes a plain edge, \
+             canonicalization ignores it, and retract cannot reach it. Use \
+             lemmalog_canonicalize instead"
+                .to_string(),
+        );
+    }
+    if f.pred.starts_with("no_") || f.pred.starts_with("sin_") {
+        return Some(format!(
+            "relation `{}` is a negation — assert the positive relation instead, so a \
+             rule can negate it with `!atom`; a negative name is invisible to the \
+             contradiction instruments",
+            f.pred
+        ));
+    }
+    if has_embedded_date(&f.pred) {
+        return Some(format!(
+            "relation `{}` carries a date in its NAME — that mints a fresh relation per \
+             measurement. Keep the relation stable and date the object, or add a \
+             separate `measured_on` fact with a bare YYYY-MM-DD",
+            f.pred
+        ));
+    }
+    // The prose signal is reported as a RATIO, not per line — see
+    // [`payload_ratio`]. Judging "is this object prose?" line by line needs
+    // a prose-by-contract list that cannot be complete: `dead_end`,
+    // `hypothesis`, `decision`, `causa` and `describes` all MANDATE a
+    // phrase as the object (measured: 4823 facts across 1828 relations
+    // would be flagged, most of them by design).
+    None
+}
+
+/// How much of this batch the engine cannot reason over: objects whose
+/// payload is prose rather than a bare value. `(flagged, total)`.
+///
+/// Measured on the shared store (2026-09-22): 30.4% of knowledge objects
+/// carry 8+ underscore segments while only 5.7% are a bare integer or date,
+/// so `sum`/`count`/`<` reach almost nothing. Reporting the ratio keeps the
+/// signal loud without inventing a per-fact verdict.
+pub fn payload_ratio(facts: &[CandidateFact]) -> (usize, usize) {
+    // Relations whose contract MANDATES a phrase as the object: the skill
+    // asks for `--dead_end--> why it failed, where confirmed`,
+    // `--hypothesis--> claim in plain words` and
+    // `--decision--> chose scope X because Y`. Measured on the shared store:
+    // 861 facts in these relations versus 3871 in the relations that are
+    // genuinely carrying a finding where a value belongs (`estado`,
+    // `pendiente_ok_pere_*`, `advertencia`). Excluding them keeps the ratio
+    // pointed at the real defect instead of training readers to ignore it.
+    const PROSE_BY_CONTRACT: [&str; 8] = [
+        "dead_end",
+        "evidence",
+        "evidencia",
+        "causa",
+        "hypothesis",
+        "decision",
+        "regla",
+        "riesgo",
+    ];
+    let mut flagged = 0;
+    for f in facts {
+        // Source anchors are references, not payload.
+        if f.pred == "located"
+            || f.pred == "describes"
+            || f.obj.contains('/')
+            || f.obj.contains(':')
+        {
+            continue;
+        }
+        if PROSE_BY_CONTRACT.contains(&f.pred.as_str()) {
+            continue;
+        }
+        if f.obj.split('_').count() >= 8 {
+            flagged += 1;
+        }
+    }
+    (flagged, facts.len())
+}
+
+/// Share of a batch that is payload-prose above which the habit is worth
+/// naming: below this it is incidental, above it is how the batch was
+/// written. Both the CLI and the MCP render the same sentence, so it lives
+/// here rather than being retyped per caller.
+const PAYLOAD_ADVISORY_PCT: usize = 25;
+
+/// One line for a batch whose objects mostly carry the payload, or `None`.
+/// Callers must render this WITHOUT the word "dropped": `lemmalog_commit`
+/// decides rollback by sniffing that word out of the observe report.
+pub fn payload_advisory(payload: (usize, usize)) -> Option<String> {
+    let (prose, total) = payload;
+    if total == 0 || prose * 100 / total < PAYLOAD_ADVISORY_PCT {
+        return None;
+    }
+    Some(format!(
+        "payload: {prose}/{total} object(s) carry 8+ underscore segments — the engine cannot \
+         sum, count or order them; keep the relation short and stable and split the payload \
+         into one fact per value"
+    ))
+}
+
+/// The advisory list as display lines, capped. One owner: the CLI used to
+/// print an uncapped, uncounted variant, so advisories 4..n vanished there
+/// without the "(+N more)" the MCP surface showed.
+pub fn render_advisories(advisories: &[(String, String)]) -> Vec<String> {
+    const SHOWN: usize = 3;
+    const LINE_WIDTH: usize = 60;
+    let mut out: Vec<String> = advisories
+        .iter()
+        .take(SHOWN)
+        .map(|(line, advice)| {
+            let short = match line.char_indices().nth(LINE_WIDTH) {
+                Some((cut, _)) => format!("{}…", &line[..cut]),
+                None => line.clone(),
+            };
+            format!("`{short}` — {advice}")
+        })
+        .collect();
+    if advisories.len() > SHOWN {
+        out.push(format!("(+{} more)", advisories.len() - SHOWN));
+    }
+    out
+}
+
+impl IngestReport {
+    /// Fill the advisory channels from the batch that produced this report.
+    /// Every ingest path must call this, so it lives next to the report
+    /// instead of being repeated at each call site.
+    fn annotate(&mut self, candidates: &[CandidateFact]) {
+        self.advisories = fact_advisories(candidates);
+        self.payload = payload_ratio(candidates);
+    }
+}
+
+/// A temporal stamp baked into a NAME. Three shapes, all measured in the
+/// shared store (165 relations / 198 facts carry one): a year
+/// (`confirmado_20260916`), a trailing clock or sequence number
+/// (`verificado_1509`), or a relative word (`medido_hoy`, `desplegado_ahora`).
+fn has_embedded_date(s: &str) -> bool {
+    let lower = s.to_lowercase();
+    if lower.ends_with("_hoy") || lower.ends_with("_ahora") || lower.ends_with("_today") {
+        return true;
+    }
+    // trailing `_1509` / `_20260916`
+    if let Some(tail) = lower.rsplit('_').next() {
+        if tail.len() == 4 && tail.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    let digits: Vec<char> = lower.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits.windows(4).any(|w| {
+        let year: String = w.iter().collect();
+        matches!(year.as_str(), "2024" | "2025" | "2026" | "2027")
+    })
+}
+
+/// Advisories for a parsed batch, as `(line, advice)` pairs. Callers render
+/// these WITHOUT the word "dropped": `lemmalog_commit` decides rollback by
+/// sniffing that word out of the observe report (the `lemmalog_commit` arm
+/// of `tool_call` in `src/bin/lemmalog-mcp.rs`), and
+/// an advisory must never roll a commit back.
+pub fn fact_advisories(facts: &[CandidateFact]) -> Vec<(String, String)> {
+    facts
+        .iter()
+        .filter_map(|f| {
+            fact_advisory(f).map(|advice| (format!("{} --{}--> {}", f.subj, f.pred, f.obj), advice))
+        })
+        .collect()
+}
+
 /// Strict protocol parsing for MODEL output: lines that are not exactly
 /// `Entity --relation[conf]--> Entity` with clean entity tokens are
 /// dropped. Reasoning models sometimes leak deliberation into the answer;
@@ -327,6 +513,12 @@ pub struct IngestReport {
     pub updated: usize,
     pub noop: usize,
     pub escalations: Vec<String>,
+    /// `(line, advice)` for facts that WERE asserted but the engine cannot
+    /// reason over — see [`fact_advisory`]. Never a refusal; callers must
+    /// render these without the word "dropped" (see `fact_advisories`).
+    pub advisories: Vec<(String, String)>,
+    /// `(prose_objects, total)` for this batch — see [`payload_ratio`].
+    pub payload: (usize, usize),
 }
 
 /// Agent memory facade: engine + extraction + episodes + escalations.
@@ -395,6 +587,7 @@ impl<X: Extractor> AgentMemory<X> {
         };
         let candidates = self.extractor.extract(&episode);
         let mut report = IngestReport::default();
+        report.annotate(&candidates);
         for c in &candidates {
             self.apply_update(c, &episode, &mut report);
         }
@@ -417,6 +610,7 @@ impl<X: Extractor> AgentMemory<X> {
         };
         let candidates = self.extractor.extract(&episode);
         let mut report = IngestReport::default();
+        report.annotate(&candidates);
         for c in &candidates {
             self.apply_update(c, &episode, &mut report);
         }
@@ -456,7 +650,8 @@ impl<X: Extractor> AgentMemory<X> {
         }
         if let Some(k) = open.iter().find(|k| k[2] == obj).cloned() {
             // same fact re-observed: merge annotation, no structural change...
-            self.engine.declare("edge", &k, Ann::base(c.confidence, [ep.id.clone()]));
+            self.engine
+                .declare("edge", &k, Ann::base(c.confidence, [ep.id.clone()]));
             // ...except when the relation is exclusive and OTHER values are
             // still open. Declaring exclusive() is not retroactive: it only
             // supersedes at assert time, so a slot that already held three
@@ -464,13 +659,13 @@ impl<X: Extractor> AgentMemory<X> {
             // the right one landed here as a NOOP. Re-stating the truth is the
             // natural repair gesture, so let it close the stale siblings.
             if self.is_exclusive(&pred) && open.len() > 1 {
-                let stale: Vec<Vec<Value>> =
-                    open.iter().filter(|o| o[2] != obj).cloned().collect();
+                let stale: Vec<Vec<Value>> = open.iter().filter(|o| o[2] != obj).cloned().collect();
                 for old in stale {
                     let mut closed = old.clone();
                     closed[4] = Value::Int(self.engine.now);
                     self.engine.retract("edge", &old);
-                    self.engine.declare("edge", &closed, Ann::base(0.9, ["superseded"]));
+                    self.engine
+                        .declare("edge", &closed, Ann::base(0.9, ["superseded"]));
                     report.updated += 1;
                 }
                 return;
@@ -523,9 +718,21 @@ impl<X: Extractor> AgentMemory<X> {
     /// relations are not named in English needs.
     fn is_multi(&self, pred: &Value) -> bool {
         const MULTI: [&str; 15] = [
-            "evidence", "mentions", "located", "describes", "tag",
-            "related_to", "depends_on", "owns", "calls", "part_of",
-            "source", "cites", "symptom_of", "aka", "alias_of",
+            "evidence",
+            "mentions",
+            "located",
+            "describes",
+            "tag",
+            "related_to",
+            "depends_on",
+            "owns",
+            "calls",
+            "part_of",
+            "source",
+            "cites",
+            "symptom_of",
+            "aka",
+            "alias_of",
         ];
         let name = self.engine.interner.display(pred).to_string();
         let declared_multi = !self.engine.query("multi", &[Some(*pred)]).is_empty();
@@ -539,13 +746,17 @@ impl<X: Extractor> AgentMemory<X> {
     /// At most one open value per (S,P).
     fn is_exclusive(&self, pred: &Value) -> bool {
         const FUNCTIONAL: [&str; 7] = [
-            "status", "phone", "address", "email", "version", "value_of",
+            "status",
+            "phone",
+            "address",
+            "email",
+            "version",
+            "value_of",
             "current_value",
         ];
         let name = self.engine.interner.display(pred).to_string();
         let functional = FUNCTIONAL.iter().any(|f| name.starts_with(f));
-        let exclusive =
-            functional || !self.engine.query("exclusive", &[Some(*pred)]).is_empty();
+        let exclusive = functional || !self.engine.query("exclusive", &[Some(*pred)]).is_empty();
         exclusive && !self.is_multi(pred)
     }
 
@@ -710,6 +921,7 @@ impl<X: Extractor> AgentMemory<X> {
             speaker: None,
         };
         let mut report = IngestReport::default();
+        report.annotate(&candidates);
         for c in &candidates {
             self.apply_update(c, &episode, &mut report);
         }
@@ -939,7 +1151,10 @@ impl<X: Extractor> AgentMemory<X> {
                 (
                     "edge",
                     self.engine
-                        .query("edge", &[Some(subj), Some(pred), Some(obj), None, None, None])
+                        .query(
+                            "edge",
+                            &[Some(subj), Some(pred), Some(obj), None, None, None],
+                        )
                         .into_iter()
                         .map(|(k, _)| k)
                         .filter(|k| matches!(k[4].as_int(), Some(vt) if vt == i64::MAX))
@@ -1052,6 +1267,12 @@ impl<X: Extractor> AgentMemory<X> {
         }
         // latest values per slot (supersession history)
         let q_lower = query.to_lowercase();
+        // Bilingual: this store's questions are written in Spanish at
+        // least as often as English (measured: `estado`/`versión`-type
+        // questions with zero English trigger word never got this
+        // section). "es"/"son" are deliberately excluded — they are also
+        // real relation names (411/38 facts) and would fire on almost any
+        // Spanish sentence.
         if q_lower.contains("current")
             || q_lower.contains(" now")
             || q_lower.contains("latest")
@@ -1059,6 +1280,17 @@ impl<X: Extractor> AgentMemory<X> {
             || q_lower.contains("price")
             || q_lower.contains("how much")
             || q_lower.contains("value")
+            || q_lower.contains("estado")
+            || q_lower.contains("actual")
+            || q_lower.contains("vigente")
+            || q_lower.contains("ultimo")
+            || q_lower.contains("último")
+            || q_lower.contains("cuanto")
+            || q_lower.contains("cuánto")
+            || q_lower.contains("importe")
+            || q_lower.contains("valor")
+            || q_lower.contains("version")
+            || q_lower.contains("versión")
         {
             let mut slots: std::collections::BTreeMap<(String, String), Vec<(i64, String)>> =
                 std::collections::BTreeMap::new();
@@ -1119,6 +1351,22 @@ impl<X: Extractor> AgentMemory<X> {
             if lines > 0 {
                 base.push_str(&sec);
             }
+        }
+        // Both appended sections above are cut LINE by line at fixed
+        // counts (6 attribution rows, 8 slots), never against the caller's
+        // budget: measured on the shared store, a 63-line CURRENT STATE
+        // section on top of an already-full `base` overshot a 1000-token
+        // budget by ~40%. Cap the total the same way `base` itself is
+        // capped (`budget_tokens * 4` bytes) rather than let a caller that
+        // asked for a small budget get a payload several times its size.
+        let hard_cap = budget_tokens.saturating_mul(4).max(base.len().min(1));
+        if base.len() > hard_cap {
+            let mut cut = hard_cap;
+            while cut > 0 && !base.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            base.truncate(cut);
+            base.push_str("\n… (attribution/current-state truncated to budget)");
         }
         base
     }

@@ -166,3 +166,111 @@ clasificación con Stanley duplicó algo que ya estaba resuelto por reglas.
   retirar antes esas reglas mata derivaciones.
 - 418 singleton con `S`/`O` con espacios o caracteres que el protocolo
   `S --rel--> O` no acepta sin riesgo.
+
+---
+
+## Reglas de vocabulario instaladas — lote `b161`
+
+Fuente exacta (reproducible; revertir con `lemmalog_uninstall b161`):
+
+```
+lema_poda(R) :- uso_relacion(R, N), N = 1.
+lema_marginal(R) :- uso_relacion(R, N), N =< 2.
+lema_estable(R) :- uso_relacion(R, N), N >= 5.
+lema_colapsable(A, B, count(O)) :- lema_estable(A), lema_estable(B), current(S, A, O), current(S, B, O).
+```
+
+`uso_relacion(R, N)` ya existía en el store: N = slots `(S, O)` distintos por
+nombre. El lote añade la lectura curada encima:
+
+| predicado | filas | significado |
+|---|---:|---|
+| `lema_estable(R)` | **421** | N ≥ 5 — el vocabulario escogido |
+| `lema_marginal(R)` | **1.276** | N ≤ 2 |
+| `lema_poda(R)` | 586 → **167** | N = 1 — pendiente de poda |
+| `lema_colapsable(A,B,N)` | 457 | pares con slots compartidos: evidencia para unificar |
+
+Sintaxis real del motor (aprendida a base de sondas rechazadas):
+comparación es `=<`, **no** `<=` y **no** `=<`→`<=`; **no existe operador de
+desigualdad** (`!=` y `<>` se rechazan), así que `lema_colapsable` incluye los
+pares consigo mismo y hay que descartarlos al consultar; los agregados
+(`count(...)` en cabeza) sí funcionan. El join agregado tardó **94,5 s** de
+cómputo: es caro, mantenerlo en un lote propio.
+
+## Promover y eliminar vocabulario (operativo)
+
+```
+lemmalog_query  current(X, "mi_rel", Y)      # existe por sus hechos, no hay diccionario
+lemmalog_query  lema_estable(R)              # sube a escogido al llegar a N >= 5
+lemmalog_install_rules  'multi("mi_rel").'   # o exclusive("mi_rel").: política de update
+lemmalog_query  lema_poda(R)                 # la lista exacta a podar
+lemmalog_uninstall  b<N>                     # antes: desinstalar el lote que lee ese nombre
+lemmalog_retract  'S --mi_rel--> O'          # el nombre sale del vocabulario
+```
+
+Los alias **no eliminan**: `lemmalog_canonicalize` unifica en lectura
+(`current_canon`), y el slot medio solo se proyecta si se instala
+`current_vocab(S, R2, O) :- current(S, R1, O), maps_to(R1, R2).` (hecho: `b158`).
+
+## Estado final y residuo estructural
+
+| | inicio de sesión | final |
+|---|---:|---:|
+| hechos `current` | 24.693 | **19.623** |
+| nombres de relación | 6.732 | **1.662** |
+| snapshot | 9.464.712 B | **8.777.655 B** |
+| `alias` / escalaciones | 18 / 0 | 18 / 0 |
+
+Se retractaron 5.070 hechos en dos pasadas: 4.651 relaciones de un solo uso, y
+419 más que una pasada anterior había descartado por un fallo de parseo propio
+(no era límite del protocolo `S --rel--> O`).
+
+Los **167** de `lema_poda` que quedan son irreducibles desde fuera:
+- **77** los lee un lote de reglas instalado (`estado_fase0` vía `b1`/`b9`,
+  `d1_pk`/`d1_nodo` vía `b92`-`b98`, `backlog_medido`, `autoridad_hatchet`…).
+  Podarlos sin desinstalar antes esas reglas mata derivaciones.
+- **69** solo existen en aristas **cerradas** (`filas`, `tamano`, `progreso`,
+  `desplegado`): 439 filas históricas, 20.506 `edge` frente a 19.623 `current`.
+  `lemmalog_retract` sobre una cerrada responde `not found (no open fact
+  matches)` y no la purga. El CLI no tiene `compact` ni `gc`
+  (`observe|retract|query|context|why|rules|rmrules|batches|dump`).
+
+Es decir: la limpieza por datos está agotada. Lo que queda pide **compactación
+en el motor** (purgar aristas cerradas), que además aliviaría el coste de carga
+de `lemmalog-src-mcz`.
+
+## Jev y Laya en lemmalog
+
+- **Jev** (`src/jev.rs`) es el juez: `Question::{Noul, Score, Choice}` →
+  probabilidad de sí / nivel / etiqueta, con confianza y distribución, y
+  `Response.model` (p. ej. `jev-1.13.0`) para reproducir la corrida. Entorno:
+  `TYPESAFE_API_KEY`, `TYPESAFE_BASE_URL` (un juez local gana al hosted),
+  `TYPESAFE_MODEL` (la selección del operador manda sobre cualquier default).
+- **Laya (Ollaya)** es el endpoint local que contesta ese protocolo
+  (`http://127.0.0.1:11435`, `winnow:e4b-t08`): no es un cliente distinto, es el
+  servidor. El mismo endpoint sirve la vía generativa (`OpenAiClient` en
+  `src/llm.rs`: chat/completions para extracción, `strip_think`, embeddings).
+- **Dónde decide sobre el vocabulario**: `src/canonical.rs` —
+  `reconcile_with_jev`, `align_pair`, `Verdict`, `route_of`; es Jev quien
+  dictamina si dos nombres son el mismo (`tests/jev_test.rs`:
+  `canonical_is_the_shorter_name`, `the_cut_points_follow_from_three_levels`,
+  `companion_nouls_ride_along_for_the_curator`,
+  `missing_companion_noul_is_an_error_not_nan`).
+- **En los gates**: `src/gate.rs`, rúbrica de 4 criterios, `jev_model()` =
+  `LEMMALOG_JEV_MODEL` > `TYPESAFE_MODEL` > `jev-latest`, `jev_client()` resuelve
+  la base una sola vez (`LEMMALOG_JEV_BASE` > `TYPESAFE_BASE_URL` > hosted).
+  Sesiones y calibración en `~/.lemmalog/gates/` y `gate-calibration.jsonl`.
+- **En preguntas profundas**: `src/agent.rs::ask_deep`.
+
+El pipeline completo del vocabulario queda así:
+
+```
+uso_relacion(R,N)  →  lema_estable / lema_poda      (selección determinista, b161)
+                   →  lema_colapsable(A,B,N)        (candidatos por slots compartidos)
+                   →  reconcile_with_jev            (Jev dictamina el alias)
+                   →  alias asertado (read-side) + alias_conflict (freno)
+```
+
+`lema_colapsable` es la entrada nueva: convierte "CORE por defecto" en candidato
+medido. El determinismo del store no se contamina porque Jev **solo propone**: no
+muta el datalog, y las reglas duras no suben un veredicto.

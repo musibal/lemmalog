@@ -140,6 +140,14 @@ pub trait Annotation: Clone + std::fmt::Debug + PartialEq {
         self
     }
 
+    /// Whether `derive` records anything. `false` (matching the identity
+    /// default) lets `emit_head` skip the O(clause) content hash it would
+    /// otherwise pay on every single emission. Any carrier that overrides
+    /// `derive` to record must override this to `true`.
+    fn derives() -> bool {
+        false
+    }
+
     /// The factor a negated literal contributes. `found` is the annotation of
     /// the matching fact, or `None` when the relation has no match.
     ///
@@ -490,8 +498,14 @@ impl<A: Annotation> Env<A> {
     }
 
     fn bind(&mut self, v: &str, val: Value) {
-        self.trail.push((v.to_string(), self.map.get(v).copied()));
-        self.map.insert(v.to_string(), val);
+        let prev = self.map.get(v).copied();
+        if prev == Some(val) {
+            // already bound to this value: no trail churn, no allocation
+            return;
+        }
+        let owned = v.to_string();
+        self.trail.push((owned.clone(), prev));
+        self.map.insert(owned, val);
     }
 
     fn mark(&self) -> Mark<A> {
@@ -990,30 +1004,81 @@ impl<A: Annotation> Engine<A> {
     /// facts derived this epoch. Pending deltas are consumed: a subsequent
     /// `run()` with no new assertions derives nothing.
     pub fn run(&mut self) -> usize {
+        // ponytail: opt-in profiling via env; zero cost when unset
+        let prof = std::env::var("LEMMALOG_PROFILE_RUN").is_ok();
+        let t_run = std::time::Instant::now();
         let strata_pre = self.strata().ok();
+        if prof {
+            eprintln!(
+                "[prof] run strata#1 {:.0}ms",
+                t_run.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         if self.program_dirty {
             if let Some(s) = &strata_pre {
+                let t0 = std::time::Instant::now();
                 self.program_recompute(s);
+                if prof {
+                    eprintln!(
+                        "[prof] run program_recompute {:.0}ms",
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
             }
         }
         // program-embedded facts
         let fact_clauses: Vec<Clause> =
             self.clauses.iter().filter(|c| c.is_fact).cloned().collect();
+        let t0 = std::time::Instant::now();
         for c in &fact_clauses {
             if let Some(args) = self.ground_args(&c.head.args) {
                 self.declare(&c.head.pred, &args, A::one());
             }
+        }
+        if prof {
+            eprintln!(
+                "[prof] run ground_program_facts {:.0}ms",
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         let strata = match self.strata() {
             Ok(s) => s,
             Err(_) => return 0, // use check_program to surface the error
         };
+        if prof {
+            eprintln!(
+                "[prof] run strata#2 {:.0}ms",
+                t_run.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         // main evaluation: strata in order (negated predicates are always
         // lower-stratum or EDB, so within-run negation reads are complete)
         let mut derived = 0;
         for stratum in &strata {
-            derived += self.eval_stratum(stratum);
+            let t0 = std::time::Instant::now();
+            let d = self.eval_stratum(stratum);
+            derived += d;
+            if prof && (d > 0 || t0.elapsed().as_millis() > 50) {
+                let label = stratum
+                    .iter()
+                    .take(4)
+                    .map(|&ci| {
+                        let c = &self.clauses[ci];
+                        match &c.name {
+                            Some(n) => format!("{n}|{}", c.head.pred),
+                            None => format!("#{}|{}", ci, c.head.pred),
+                        }
+                    })
+                    .collect::<Vec<String>>()
+                    .join(",");
+                eprintln!(
+                    "[prof] run stratum n={} {:.0}ms (+{d}) [{}]",
+                    stratum.len(),
+                    t0.elapsed().as_secs_f64() * 1000.0,
+                    label
+                );
+            }
         }
         // invalidation passes AFTER evaluation: retractions (supersession)
         // and cross-run growth of negated predicates leave stale derived
@@ -1024,6 +1089,16 @@ impl<A: Annotation> Engine<A> {
             .clauses
             .iter()
             .any(|c| !c.is_fact && c.body.iter().any(|l| matches!(l, Lit::Neg(_))));
+        // Each pass below re-adds the rows it rebuilt; those re-adds land in
+        // the change window and, seen through `last_run_log_len`, made every
+        // later iteration clear and rebuild the SAME slice again (measured
+        // 2026-09-29: 7 identical rebuilds, ~4.5s each, of the 39 negation-
+        // reading predicates — 86% of a full load). Only genuinely NEW
+        // invalidation events may trigger the next pass: growth of a
+        // negated input pred outside this loop, or retraction marks pushed
+        // by the aggregate fold mid-pass (the pass's internal rounds already
+        // reach every transitive dependent of what it cleared and changed).
+        let mut log_mark = self.last_run_log_len;
         let mut guard = 0;
         loop {
             guard += 1;
@@ -1031,7 +1106,13 @@ impl<A: Annotation> Engine<A> {
                 break;
             }
             let mut extra_clear: BTreeSet<String> = BTreeSet::new();
-            if neg_rules {
+            if neg_rules && self.epoch > 0 {
+                // second+ run: growth of a negated input pred can block rows
+                // the reader derived earlier — clear and rebuild the readers.
+                // A cold load (epoch 0) evaluates every reader inside the
+                // strata pass after all its negated inputs were materialized,
+                // and nothing retracts there (verified: retracted set empty on
+                // a 63k-fact cold load), so the staleness pass is skipped.
                 let neg_readers: BTreeSet<(String, String)> = self
                     .clauses
                     .iter()
@@ -1043,7 +1124,7 @@ impl<A: Annotation> Engine<A> {
                         })
                     })
                     .collect();
-                let grew: BTreeSet<&String> = self.change_log[self.last_run_log_len..]
+                let grew: BTreeSet<&String> = self.change_log[log_mark..]
                     .iter()
                     .map(|(_, (p, _))| p)
                     .collect();
@@ -1056,8 +1137,32 @@ impl<A: Annotation> Engine<A> {
             if self.retracted.is_empty() && extra_clear.is_empty() {
                 break;
             }
+            if prof {
+                eprintln!(
+                    "[prof] run negloop epoch={} retracted={} extra_clear={}",
+                    self.epoch,
+                    self.retracted.len(),
+                    extra_clear.len()
+                );
+            }
+            if prof {
+                eprintln!(
+                    "[prof] run negation_clear {:?}",
+                    extra_clear.iter().collect::<Vec<_>>()
+                );
+            }
+            let t0 = std::time::Instant::now();
             let (_, d) = self.scoped_recompute(&strata, extra_clear);
+            if prof {
+                eprintln!(
+                    "[prof] run scoped_recompute {:.0}ms (+{d})",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             derived += d;
+            // consume this pass's own re-adds so the next pass triggers only
+            // on events that happened AFTER the rebuild
+            log_mark = self.change_log.len();
         }
         self.last_run_log_len = self.change_log.len();
         for rel in self.relations.values_mut() {
@@ -1580,9 +1685,29 @@ impl<A: Annotation> Engine<A> {
             }
         }
         let mut total_new = 0usize;
+        // ponytail: opt-in per-rule attribution (LEMMALOG_PROFILE_RUN); zero cost off
+        let prof = std::env::var("LEMMALOG_PROFILE_RUN").is_ok();
+        // labels exist only to attribute profile time: building them with
+        // profiling off costs one `format!` per clause on every stratum pass
+        let labels: Vec<String> = if prof {
+            clause_idx
+                .iter()
+                .map(|&ci| {
+                    let c = &self.clauses[ci];
+                    match &c.name {
+                        Some(n) => format!("{n}|{}", c.head.pred),
+                        None => format!("#{ci}|{}", c.head.pred),
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut by_clause: std::collections::HashMap<String, (f64, usize)> =
+            std::collections::HashMap::new();
         loop {
             let mut new_facts: Vec<Key> = Vec::new();
-            for clause in &clauses {
+            for (cpos, clause) in clauses.iter().enumerate() {
                 let pos: Vec<usize> = clause
                     .body
                     .iter()
@@ -1601,7 +1726,18 @@ impl<A: Annotation> Engine<A> {
                     continue;
                 }
                 for &ai in &pos {
+                    let t0 = if prof {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
+                    let before = if prof { new_facts.len() } else { 0 };
                     self.fire_delta_version(clause, ai, &delta, &mut new_facts);
+                    if let Some(t0) = t0 {
+                        let e = by_clause.entry(labels[cpos].clone()).or_insert((0.0, 0));
+                        e.0 += t0.elapsed().as_secs_f64() * 1000.0;
+                        e.1 += new_facts.len() - before;
+                    }
                 }
             }
             if new_facts.is_empty() {
@@ -1611,6 +1747,13 @@ impl<A: Annotation> Engine<A> {
             delta.clear();
             for (p, a) in new_facts {
                 delta.entry(p).or_default().insert(a);
+            }
+        }
+        if prof {
+            let mut rows: Vec<(&String, &(f64, usize))> = by_clause.iter().collect();
+            rows.sort_by(|a, b| (b.1).0.total_cmp(&(a.1).0));
+            for (label, (ms, der)) in rows.iter().take(6) {
+                eprintln!("[prof] stratum rule {label} {:.0}ms (+{der})", ms);
             }
         }
         for ci in agg_clauses {
@@ -1940,23 +2083,35 @@ impl<A: Annotation> Engine<A> {
             };
             args.push(v);
         }
-        let rule = clause
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("rule/{}", clause.head.pred));
-        // stamp the body product with this derivation's identity before it is
+        // Stamp the body product with this derivation's identity before it is
         // summed into the head; the default impl is a no-op. The identity is
         // the clause's content, not `rule` - `rule` is the why() label, which
         // is shared by every unnamed clause of one head predicate.
-        let ann = env.ann.clone().derive(clause.id(), &env.body_keys);
-        let support = Support::Rule {
-            rule,
-            body: env.body_keys.clone(),
-        };
-        // fast path: duplicate emission — merge + capped witness recording
+        let mut ann = env.ann.clone();
+        if A::derives() {
+            ann = ann.derive(clause.id(), &env.body_keys);
+        }
+        // Duplicate emission is the hot path in recursive fixpoints (each
+        // derivation arrives once per body-atom permutation): `rule` and the
+        // whole witness path are only needed to record a support under the
+        // cap, so build them lazily.
         if let Some(rel) = self.relations.get_mut(&clause.head.pred) {
-            if rel.merge_ann(&args, &ann, support.clone()) {
-                return None;
+            if let Some(existing) = rel.get(&args) {
+                let support = if existing.supports.len() >= SUPPORT_CAP {
+                    // discarded under the cap; a one-unit value is cheapest
+                    Support::Base
+                } else {
+                    Support::Rule {
+                        rule: clause
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("rule/{}", clause.head.pred)),
+                        body: env.body_keys.clone(),
+                    }
+                };
+                if rel.merge_ann(&args, &ann, support) {
+                    return None;
+                }
             }
         }
         let rel = self.relations.entry(clause.head.pred.clone()).or_default();
@@ -1965,7 +2120,13 @@ impl<A: Annotation> Engine<A> {
             key.1.clone(),
             StoredFact {
                 ann,
-                supports: vec![support],
+                supports: vec![Support::Rule {
+                    rule: clause
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("rule/{}", clause.head.pred)),
+                    body: env.body_keys.clone(),
+                }],
             },
         );
         if is_new {

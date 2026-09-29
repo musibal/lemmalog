@@ -521,3 +521,101 @@ fn uninstall_reverts_batch_fact_declarations() {
         "uninstall must remove the declaration the batch asserted"
     );
 }
+
+#[test]
+fn stale_negation_rebuild_runs_once_per_run() {
+    // Regression for the invalidation loop at the tail of `Engine::run`: each
+    // staleness pass wholesale-clears the slices it rebuilds and re-adds their
+    // rows through `emit_head`, landing them in the change feed. If the loop
+    // does not consume the window it just wrote, the next pass re-reads its own
+    // re-adds as new growth and clears+rebuilds the SAME slice again, once per
+    // iteration until the guard cuts it (measured on the live store
+    // 2026-09-29: 7 identical passes of the 39 negation-reading predicates,
+    // ~4.5 s each, +0 derived — 86% of a full load). Observable behavior:
+    // within one run's change feed, a derived fact is added exactly once and a
+    // slice is cleared exactly once per pass; the pass itself still re-derives
+    // correctly (stale reader rows blocked by growth are withdrawn).
+    use lemmalog::Change;
+
+    fn feed_kinds(feed: &[Change]) -> Vec<(&'static str, String)> {
+        feed.iter()
+            .map(|c| match c {
+                Change::Added(_, (p, _)) => ("added", p.clone()),
+                Change::Retracted(_, (p, _)) => ("retracted", p.clone()),
+                Change::Cleared(_, p) => ("cleared", p.clone()),
+            })
+            .collect()
+    }
+
+    let mut e = Engine::new();
+    e.install_program("g(X) :- edb(X), flag(X).\nrd(X) :- edb(X), !g(X).")
+        .unwrap();
+    for x in ["a", "b", "c", "d"] {
+        let x = e.sym(x);
+        e.declare("edb", &[x], Ann::unit());
+        e.declare("flag", &[x], Ann::unit());
+    }
+    for x in ["e", "f", "g"] {
+        let x = e.sym(x);
+        e.declare("edb", &[x], Ann::unit());
+    }
+    e.run();
+    assert_eq!(e.query("g", &[]).len(), 4);
+    assert_eq!(
+        e.query("rd", &[]).len(),
+        3,
+        "cold load: e, f, g not blocked yet"
+    );
+
+    // Cold load (epoch 0): the staleness pass must not fire at all — the
+    // strata pass evaluated every reader after its negated inputs were
+    // materialized — so nothing is cleared and every derived fact is added
+    // exactly once, never re-added by a redundant rebuild.
+    let k0 = feed_kinds(&e.changes_since(0));
+    assert_eq!(
+        k0.iter().filter(|(k, p)| *k == "added" && p == "g").count(),
+        4,
+        "{k0:?}"
+    );
+    assert_eq!(
+        k0.iter()
+            .filter(|(k, p)| *k == "added" && p == "rd")
+            .count(),
+        3,
+        "{k0:?}"
+    );
+    assert!(
+        !k0.iter().any(|(k, _)| *k != "added"),
+        "cold load must not clear or retract anything: {k0:?}"
+    );
+
+    // Cross-run growth of the negated input: the reader slice rebuilds EXACTLY
+    // once — one wholesale clear, the surviving rows re-added once each, and
+    // the newly blocked row withdrawn. Semantics pin the pass still works;
+    // the feed counts pin it runs once, not until the guard.
+    let g = e.sym("g");
+    e.declare("flag", &[g.clone()], Ann::unit());
+    e.run();
+    assert_eq!(e.query("rd", &[]).len(), 2, "rd(g) blocked, survivors kept");
+    assert_eq!(e.query("rd", &[Some(g)]).len(), 0, "stale rd(g) withdrawn");
+    let k1 = feed_kinds(&e.changes_since(1));
+    assert_eq!(
+        k1.iter()
+            .filter(|(k, p)| *k == "cleared" && p == "rd")
+            .count(),
+        1,
+        "{k1:?}"
+    );
+    assert_eq!(
+        k1.iter()
+            .filter(|(k, p)| *k == "added" && p == "rd")
+            .count(),
+        2,
+        "{k1:?}"
+    );
+    assert_eq!(
+        k1.iter().filter(|(k, p)| *k == "added" && p == "g").count(),
+        1,
+        "{k1:?}"
+    );
+}

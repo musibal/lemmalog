@@ -33,6 +33,9 @@ struct Tally {
 }
 
 impl Annotation for Tally {
+    fn derives() -> bool {
+        true
+    }
     fn one() -> Self {
         Tally {
             atoms: 0,

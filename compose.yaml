@@ -19,6 +19,16 @@ services:
       # Log de eventos persistente, en el volumen del host: sobrevive a un
       # recreate del contenedor, que `docker logs` no.
       LEMMALOG_MCP_EVENTS: /data/eventos.jsonl
+    # El puerto se publica al instante, pero el servidor no acepta hasta haber
+    # cargado el snapshot: medido ~40 s con lemmalog-memory.snapshot de 8,8 MB.
+    # Sin esto, docker informa "sano" desde el segundo uno y un cliente MCP que
+    # arranque a la vez ve el servidor caido y desiste.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8765"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 120s
     mem_limit: 14g
     memswap_limit: 14g
     restart: unless-stopped

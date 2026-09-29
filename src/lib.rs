@@ -29,11 +29,13 @@ pub mod agent;
 pub mod ast;
 pub mod canonical;
 pub mod eval;
+#[cfg(feature = "gate")]
+pub mod gate;
+#[cfg(any(feature = "jev", feature = "llm"))]
+pub mod http;
 pub mod intern;
 #[cfg(feature = "jev")]
 pub mod jev;
-#[cfg(feature = "gate")]
-pub mod gate;
 #[cfg(feature = "llm")]
 pub mod llm;
 #[cfg(feature = "llm")]
@@ -49,12 +51,12 @@ pub use agent::{
     DEFAULT_RULES, EXTRACTION_PROMPT,
 };
 pub use ast::{parse_program, ClauseId, ParseError};
+pub use eval::answer_text;
 pub use eval::{Ann, Annotation, Change, Engine, Interpret, StoredFact, StratError};
 pub use intern::{AggFn, Interner, Term, Value};
 pub use retrieval::{Bm25, Retrieval, Selection};
 pub use scenario::{run_eval, EvalReport, Scenario};
 pub use semantics::{Embedder, HashEmbedder, SemanticIndex, RELEVANCE_RULES};
-pub use eval::answer_text;
 
 impl<A: Annotation> Engine<A> {
     /// Install (append) a rule program. Rules are identified by optional

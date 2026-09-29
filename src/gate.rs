@@ -64,8 +64,7 @@ fn session_path(id: &str) -> Result<PathBuf, String> {
     Ok(base_dir().join(format!("{id}.json")))
 }
 fn write_atomic(path: &std::path::Path, bytes: &[u8], what: &str) -> Result<(), String> {
-    fs::create_dir_all(path.parent().unwrap())
-        .map_err(|e| format!("{what} directory: {e}"))?;
+    fs::create_dir_all(path.parent().unwrap()).map_err(|e| format!("{what} directory: {e}"))?;
     // Two daemons can share one gate directory (`~/.lemmalog/gates` is shared by
     // both harnesses), so the scratch name must not be predictable: a fixed
     // `X.tmp` lets one writer rename the other's file away mid-write.
@@ -133,7 +132,11 @@ fn restore_state_at(
             if !valid_id(id) {
                 return Err("invalid gate_id in snapshot".to_string());
             }
-            write_atomic(&dir.join(format!("{id}.json")), text.as_bytes(), "gate session")?;
+            write_atomic(
+                &dir.join(format!("{id}.json")),
+                text.as_bytes(),
+                "gate session",
+            )?;
         }
     }
     if let Some(text) = state.get("calibration").and_then(Value::as_str) {
@@ -606,6 +609,25 @@ fn inject(case: &Value, resolution: &Value) -> Value {
     }
     enriched
 }
+/// Model for jev calls: the gate's own env (`LEMMALOG_JEV_MODEL`) wins, then
+/// `TYPESAFE_MODEL` (the shared judge selection), else the historical
+/// default.
+fn jev_model() -> String {
+    crate::jev::resolve_model(std::env::var("LEMMALOG_JEV_MODEL").ok(), "jev-latest")
+}
+
+/// Base URL for jev calls: `LEMMALOG_JEV_BASE` wins, `TYPESAFE_BASE_URL`
+/// (local judge) is honored by `resolve_base_url`, else the hosted API.
+/// Resolved once here so no caller double-applies the env.
+fn jev_client() -> JevClient {
+    let model = jev_model();
+    let base = match std::env::var("LEMMALOG_JEV_BASE") {
+        Ok(base) => base,
+        Err(_) => crate::jev::resolve_base_url("https://api.typesafe.ai"),
+    };
+    JevClient::with_base(&base, &model)
+}
+
 fn run(
     case: &Value,
     builder: &str,
@@ -615,10 +637,7 @@ fn run(
     let effective = inject(case, resolution);
     let mut artifact = effective["artifact"].clone();
     let mut cycles = Vec::new();
-    let base = std::env::var("LEMMALOG_JEV_BASE")
-        .unwrap_or_else(|_| "https://api.typesafe.ai".to_string());
-    let model = std::env::var("LEMMALOG_JEV_MODEL").unwrap_or_else(|_| "jev-latest".to_string());
-    let mut client = JevClient::with_base(&base, &model);
+    let mut client = jev_client();
     for cycle in 0..=max_cycles {
         // Builders may replace the artifact. Reinject the complete evidence packet
         // before every JEV call, rather than trusting a replacement to retain it.
@@ -641,7 +660,9 @@ fn run(
             effective["id"].as_str().unwrap_or_default()
         );
         let decision = loop_decision(&review);
-        cycles.push(json!({"cycle":cycle,"review":review,"gate":decision,"artifact":judged_artifact}));
+        cycles.push(
+            json!({"cycle":cycle,"review":review,"gate":decision,"artifact":judged_artifact}),
+        );
         if cycles.last().unwrap()["gate"]["choice"].as_str() != Some("rework")
             || cycle == max_cycles
         {
@@ -789,7 +810,6 @@ pub fn outcome(args: &Value) -> Result<Value, String> {
     Ok(json!({"gate_id":id,"recorded":true}))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,7 +822,10 @@ mod tests {
         memory.maintain(100);
         let resolution = resolve_all(
             &mut memory.engine,
-            &["alice|works_at|acme".to_string(), "alice|works_at|other".to_string()],
+            &[
+                "alice|works_at|acme".to_string(),
+                "alice|works_at|other".to_string(),
+            ],
         );
         assert_eq!(resolution["resolved"].as_array().unwrap().len(), 1);
         assert_eq!(resolution["unresolved"].as_array().unwrap().len(), 1);
@@ -811,10 +834,36 @@ mod tests {
     #[test]
     fn hard_rules_only_lower_a_pass() {
         let report = json!({"result":{"final":{"choice":"pass"},"cycles":[{"review":{"dimensions":{"evidence":{"choice":"needs_work"}}}}]}});
-        let resolution = json!({"endpoint_ok":true,"resolved":[],"unresolved":[],"stale":[],"records":[]});
+        let resolution =
+            json!({"endpoint_ok":true,"resolved":[],"unresolved":[],"stale":[],"records":[]});
         let result = checked(&report, &resolution, "gate-test");
         assert_eq!(result["final_verdict"], "human_review");
         let cautious = json!({"result":{"final":{"choice":"abstain"},"cycles":[]}});
-        assert_eq!(checked(&cautious, &resolution, "gate-test")["final_verdict"], "abstain");
+        assert_eq!(
+            checked(&cautious, &resolution, "gate-test")["final_verdict"],
+            "abstain"
+        );
+    }
+
+    /// The composed URL must follow `TYPESAFE_BASE_URL`/`TYPESAFE_MODEL`
+    /// (local judge), with the gate's own env taking precedence. No network:
+    /// `base_url`/`model` are checked before any transport is built.
+    #[test]
+    fn jev_client_resolves_typesafe_env_fallbacks() {
+        std::env::set_var("TYPESAFE_BASE_URL", "http://127.0.0.1:11435");
+        std::env::set_var("TYPESAFE_MODEL", "winnow:e4b-t08");
+        let local = jev_client();
+        assert_eq!(local.base_url, "http://127.0.0.1:11435");
+        assert_eq!(local.model, "winnow:e4b-t08");
+        // the composed endpoint the transport posts to is {base}/v1/systemone
+        std::env::set_var("LEMMALOG_JEV_BASE", "http://127.0.0.1:99");
+        let explicit_gate = jev_client();
+        assert_eq!(explicit_gate.base_url, "http://127.0.0.1:99");
+        std::env::set_var("LEMMALOG_JEV_MODEL", "jev-gate-only");
+        assert_eq!(jev_client().model, "jev-gate-only");
+        std::env::remove_var("LEMMALOG_JEV_BASE");
+        std::env::remove_var("LEMMALOG_JEV_MODEL");
+        std::env::remove_var("TYPESAFE_BASE_URL");
+        std::env::remove_var("TYPESAFE_MODEL");
     }
 }

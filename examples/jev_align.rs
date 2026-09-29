@@ -29,7 +29,11 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.5);
         let p = lemmalog::canonical::jev_align::candidate_pairs(&names, min);
-        eprintln!("gate: {} names -> {} pairs (min_jaccard={min})", names.len(), p.len());
+        eprintln!(
+            "gate: {} names -> {} pairs (min_jaccard={min})",
+            names.len(),
+            p.len()
+        );
         p
     };
 
@@ -54,6 +58,7 @@ fn main() {
     }
     eprintln!(
         "calls={} failures={} merge={merge} curator={curator} leave={leave}",
-        client.calls, client.failures
+        client.calls.load(std::sync::atomic::Ordering::Relaxed),
+        client.failures.load(std::sync::atomic::Ordering::Relaxed)
     );
 }

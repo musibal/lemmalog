@@ -337,7 +337,11 @@ pub mod jev_align {
 
     /// (asserted aliases as `(local, canonical, confidence)`, curator queue,
     /// failures as `(a, b, reason)`).
-    pub type Reconciled = (Vec<(String, String, f64)>, Vec<Verdict>, Vec<(String, String, String)>);
+    pub type Reconciled = (
+        Vec<(String, String, f64)>,
+        Vec<Verdict>,
+        Vec<(String, String, String)>,
+    );
 
     fn route_of(score: f64) -> Route {
         if score >= UPPER {
@@ -354,7 +358,7 @@ pub mod jev_align {
     /// measurably moves the scores (up to 0.73 on relation names) because
     /// the other pairs act as distractors.
     pub fn align_pair(
-        client: &mut JevClient,
+        client: &JevClient,
         domain: &str,
         a: &str,
         b: &str,
@@ -485,11 +489,33 @@ pub mod jev_align {
         pairs: &[(String, String)],
         min_confidence: f64,
     ) -> Result<Reconciled, String> {
+        const WIDTH: usize = 8; // ponytail: fixed inflight cap; measured flat on the Ollaya judge (single inference queue), pays off on judges that serve concurrently
+                                // One request per pair, but now bounded-concurrent: the pairs are
+                                // independent states (they must NOT batch into one call). Order is
+                                // preserved, so the routing below is unchanged from the serial loop.
+        let client = &*client;
+        let mut judged: Vec<Result<Verdict, String>> = Vec::with_capacity(pairs.len());
+        for chunk in pairs.chunks(WIDTH) {
+            let outs = std::thread::scope(|s| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|(a, b)| s.spawn(move || align_pair(client, domain, a, b)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err(String::from("align_pair worker panicked")))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            judged.extend(outs);
+        }
         let mut asserted = Vec::new();
         let mut curator = Vec::new();
         let mut failed = Vec::new();
-        for (a, b) in pairs {
-            let v = match align_pair(client, domain, a, b) {
+        for ((a, b), v) in pairs.iter().zip(judged) {
+            let v = match v {
                 Ok(v) => v,
                 Err(err) => {
                     failed.push((a.clone(), b.clone(), err));

@@ -12,9 +12,26 @@
 //! all four.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-pub type Transport = Box<dyn Fn(&str) -> Result<String, String> + Send>;
+pub type Transport = Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+
+/// Base URL for jev: `TYPESAFE_BASE_URL` (e.g. a local Ollaya judge) wins
+/// over the hosted API default.
+pub fn resolve_base_url(fallback: &str) -> String {
+    std::env::var("TYPESAFE_BASE_URL").unwrap_or_else(|_| fallback.to_string())
+}
+
+/// Model resolution for jev: caller's own env (explicit) wins, then
+/// `TYPESAFE_MODEL` (the operator's judge selection), then the caller's
+/// historical default. `JevClient::new`'s argument is always just a
+/// fallback: an operator's `TYPESAFE_MODEL` outranks any hardcoded model.
+pub fn resolve_model(explicit: Option<String>, fallback: &str) -> String {
+    explicit
+        .or_else(|| std::env::var("TYPESAFE_MODEL").ok())
+        .unwrap_or_else(|| fallback.to_string())
+}
 
 /// One typed question. IDs are chosen by the caller and never sent to the
 /// model, so the instructions must be self-contained.
@@ -118,14 +135,19 @@ pub struct JevClient {
     pub base_url: String,
     pub model: String,
     transport: Transport,
-    pub calls: usize,
-    pub failures: usize,
+    pub calls: AtomicU64,
+    pub failures: AtomicU64,
 }
 
 impl JevClient {
-    /// HTTP transport against the TypeSafe API. Reads `TYPESAFE_API_KEY`.
+    /// HTTP transport against the TypeSafe API. Reads `TYPESAFE_API_KEY`, and
+    /// delegates base/model resolution to `resolve_base_url`/`resolve_model`
+    /// (`TYPESAFE_BASE_URL`, `TYPESAFE_MODEL`).
     pub fn new(model: &str) -> Self {
-        Self::with_base("https://api.typesafe.ai", model)
+        Self::with_base(
+            &resolve_base_url("https://api.typesafe.ai"),
+            &resolve_model(None, model),
+        )
     }
 
     /// Same, against an explicit base URL (staging, a proxy, a fake).
@@ -136,10 +158,14 @@ impl JevClient {
         JevClient {
             base_url: base,
             model: model.to_string(),
-            calls: 0,
-            failures: 0,
+            calls: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
             transport: Box::new(move |body: &str| {
-                let mut req = ureq::post(&url)
+                // shared agent: pooled keep-alive connections; connection
+                // timeout comes from the agent, `.timeout` caps the whole
+                // request (headroom for a slow hosted API; 429 backs off once)
+                let mut req = crate::http::agent()
+                    .post(&url)
                     .set("Content-Type", "application/json")
                     .timeout(Duration::from_secs(180));
                 if let Some(key) = &api_key {
@@ -177,8 +203,8 @@ impl JevClient {
             base_url: String::new(),
             model: model.to_string(),
             transport,
-            calls: 0,
-            failures: 0,
+            calls: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
         }
     }
 
@@ -191,7 +217,7 @@ impl JevClient {
     /// relation-alignment pairs, batching moved scores by up to 0.73 and
     /// changed the routing. Batch only when the questions share one state.
     pub fn ask(
-        &mut self,
+        &self,
         state: &serde_json::Value,
         questions: &[(&str, Question)],
     ) -> Result<Response, String> {
@@ -199,18 +225,21 @@ impl JevClient {
             .iter()
             .map(|(id, q)| (id.to_string(), q.to_json()))
             .collect();
-        let body = serde_json::json!({
-            "state": state,
-            "model": self.model,
-            "questions": qs,
-        })
-        .to_string();
-        self.calls += 1;
+        // one pass over `state`: concatenate the three serialized parts
+        // (`Value` prints as compact JSON), instead of cloning the state into
+        // an intermediate json! value and then serializing it all again
+        let body = format!(
+            r#"{{"state":{},"model":{},"questions":{}}}"#,
+            state,
+            serde_json::to_string(&self.model).map_err(|e| e.to_string())?,
+            serde_json::to_string(&serde_json::Value::Object(qs)).map_err(|e| e.to_string())?,
+        );
+        self.calls.fetch_add(1, Ordering::Relaxed);
         let raw = (self.transport)(&body).inspect_err(|_| {
-            self.failures += 1;
+            self.failures.fetch_add(1, Ordering::Relaxed);
         })?;
         parse_response(&raw).inspect_err(|_| {
-            self.failures += 1;
+            self.failures.fetch_add(1, Ordering::Relaxed);
         })
     }
 }
@@ -218,8 +247,7 @@ impl JevClient {
 /// Parse the wire form. Kept separate from the transport so the contract is
 /// testable without a network.
 pub fn parse_response(raw: &str) -> Result<Response, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| format!("bad json: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(raw).map_err(|e| format!("bad json: {e}"))?;
     let obj = v
         .get("answers")
         .and_then(|a| a.as_object())
@@ -244,7 +272,11 @@ pub fn parse_response(raw: &str) -> Result<Response, String> {
                     ));
                 }
                 let probabilities = int_map(a, "probabilities")?;
-                Answer::Score { score, confidence, probabilities }
+                Answer::Score {
+                    score,
+                    confidence,
+                    probabilities,
+                }
             }
             "choice" => {
                 let confidence = num(a, "confidence")?;
@@ -263,7 +295,7 @@ pub fn parse_response(raw: &str) -> Result<Response, String> {
                     confidence,
                     probabilities: str_map(a, "probabilities")?,
                 }
-            },
+            }
             // an answer kind a future API adds is skipped, not fatal
             _ => continue,
         };

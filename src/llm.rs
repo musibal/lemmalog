@@ -65,7 +65,8 @@ impl OpenAiClient {
             transport: Box::new(move |body: &str| {
                 // reasoning models can think for minutes before the answer
                 let url = format!("{url}/chat/completions");
-                let mut req = ureq::post(&url)
+                let mut req = crate::http::agent()
+                    .post(&url)
                     .set("Content-Type", "application/json")
                     .timeout(Duration::from_secs(900));
                 if let Some(key) = &api_key {
@@ -150,7 +151,8 @@ impl OpenAiClient {
         let base = base_url.trim_end_matches('/');
         let url = format!("{base}/embeddings");
         let body = serde_json::json!({"model": embed_model, "input": text}).to_string();
-        let resp = ureq::post(&url)
+        let resp = crate::http::agent()
+            .post(&url)
             .set("Content-Type", "application/json")
             .timeout(Duration::from_secs(60))
             .send_string(&body)

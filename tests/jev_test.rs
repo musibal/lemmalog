@@ -73,10 +73,7 @@ fn a_malformed_response_is_an_error_not_a_default() {
 
 #[test]
 fn rejects_out_of_range_answers() {
-    assert!(parse_response(
-        r#"{"answers":{"a":{"type":"noul","noul":2.0}}}"#
-    )
-    .is_err());
+    assert!(parse_response(r#"{"answers":{"a":{"type":"noul","noul":2.0}}}"#).is_err());
     assert!(parse_response(
         r#"{"answers":{"a":{"type":"score","score":1.0,"confidence":1.1,"probabilities":{"0":1.0}}}}"#
     )
@@ -85,10 +82,10 @@ fn rejects_out_of_range_answers() {
         r#"{"answers":{"a":{"type":"score","score":1.0,"confidence":0.8,"probabilities":{"0":-0.1}}}}"#
     )
     .is_err());
-    assert!(parse_response(
-        r#"{"answers":{"a":{"type":"score","score":1.0,"confidence":0.8}}}"#
-    )
-    .is_err());
+    assert!(
+        parse_response(r#"{"answers":{"a":{"type":"score","score":1.0,"confidence":0.8}}}"#)
+            .is_err()
+    );
 }
 
 #[test]
@@ -133,15 +130,37 @@ fn the_request_carries_state_model_and_typed_questions() {
     assert_eq!(sent["questions"]["align"]["criteria"][2], "yes");
     assert_eq!(sent["questions"]["ruido"]["type"], "noul");
     assert!(sent["questions"]["ruido"].get("criteria").is_none());
-    assert_eq!(c.calls, 1);
-    assert_eq!(c.failures, 0);
+    assert_eq!(c.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(c.failures.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 
 #[test]
 fn a_transport_failure_is_counted() {
     let mut c = JevClient::with_transport(Box::new(|_| Err("http 500".into())), "jev-latest");
     assert!(c.ask(&serde_json::json!({}), &[]).is_err());
-    assert_eq!(c.failures, 1);
+    assert_eq!(c.failures.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// `TYPESAFE_BASE_URL`/`TYPESAFE_MODEL` must reach the client the code
+/// builds by default (local judge instead of the hosted API). No network:
+/// only the resolved `base_url`/`model` fields are checked, before any
+/// transport use.
+#[test]
+fn default_client_follows_typesafe_env() {
+    std::env::set_var("TYPESAFE_BASE_URL", "http://127.0.0.1:11435");
+    std::env::set_var("TYPESAFE_MODEL", "winnow:e4b-t08");
+    let c = JevClient::new("jev-latest");
+    assert_eq!(c.base_url, "http://127.0.0.1:11435");
+    assert_eq!(
+        c.model, "winnow:e4b-t08",
+        "TYPESAFE_MODEL outranks any hardcoded caller default"
+    );
+    // and without the env vars the hosted default is the composed base
+    std::env::remove_var("TYPESAFE_BASE_URL");
+    std::env::remove_var("TYPESAFE_MODEL");
+    let hosted = JevClient::new("jev-latest");
+    assert_eq!(hosted.base_url, "https://api.typesafe.ai");
+    assert_eq!(hosted.model, "jev-latest");
 }
 
 mod alignment {
@@ -184,7 +203,10 @@ mod alignment {
         let mut c = canned(1.9, 0.9);
         let v = align_pair(&mut c, "d", "estado_20260916", "estado").unwrap();
         let (local, canonical) = v.canonical();
-        assert_eq!(canonical, "estado", "the date-suffixed name is the local one");
+        assert_eq!(
+            canonical, "estado",
+            "the date-suffixed name is the local one"
+        );
         assert_eq!(local, "estado_20260916");
     }
 
@@ -208,10 +230,8 @@ mod alignment {
                 r#"{"answers":{"align":{"type":"score","score":1.9,"confidence":0.9,"probabilities":{"0":0.0,"1":0.0,"2":1.0}},"same_domain":{"type":"noul","noul":0.9}}}"#,
             ),
         ] {
-            let mut c = JevClient::with_transport(
-                Box::new(move |_| Ok(body.to_string())),
-                "jev-latest",
-            );
+            let mut c =
+                JevClient::with_transport(Box::new(move |_| Ok(body.to_string())), "jev-latest");
             let err = align_pair(&mut c, "d", "a", "bb").unwrap_err();
             assert!(err.contains(missing), "{err}");
         }
@@ -220,10 +240,8 @@ mod alignment {
     #[test]
     fn incomplete_companion_is_reported_without_alias_mutation() {
         let body = r#"{"answers":{"align":{"type":"score","score":1.9,"confidence":0.9,"probabilities":{"0":0.0,"1":0.0,"2":1.0}}}}"#;
-        let mut c = JevClient::with_transport(
-            Box::new(move |_| Ok(body.to_string())),
-            "jev-latest",
-        );
+        let mut c =
+            JevClient::with_transport(Box::new(move |_| Ok(body.to_string())), "jev-latest");
         let mut e = Engine::new();
         let pairs = vec![("estado_a".to_string(), "estado".to_string())];
         let (asserted, curator, failed) =
@@ -242,8 +260,7 @@ mod alignment {
         let mut e = Engine::new();
         let mut c = canned(1.9, 0.05);
         let pairs = vec![("estado_20260916".to_string(), "estado".to_string())];
-        let (asserted, curator, _) =
-            reconcile_with_jev(&mut e, &mut c, "d", &pairs, 0.30).unwrap();
+        let (asserted, curator, _) = reconcile_with_jev(&mut e, &mut c, "d", &pairs, 0.30).unwrap();
         assert!(asserted.is_empty(), "nothing merged on 0.05 confidence");
         assert_eq!(curator.len(), 1, "it went to the curator instead");
 
@@ -277,7 +294,10 @@ mod alignment {
                 .iter()
                 .any(|(x, y)| (x == a && y == b) || (x == b && y == a))
         };
-        assert!(has("estado_20260916", "estado"), "the real merge must survive the gate");
+        assert!(
+            has("estado_20260916", "estado"),
+            "the real merge must survive the gate"
+        );
         assert!(has("paso_5", "paso_6"), "the trap is proposed, not decided");
         assert!(!has("wrangler", "estado"), "unrelated names share no token");
     }
@@ -293,9 +313,15 @@ mod alignment {
             .collect();
         let p = candidate_pairs(&names, 0.5);
         assert!(p.iter().all(|(a, b)| a != b), "self-pair emitted: {p:?}");
-        let dups = p.iter().filter(|(a, b)| {
-            p.iter().filter(|(x, y)| (x == a && y == b) || (x == b && y == a)).count() > 1
-        }).count();
+        let dups = p
+            .iter()
+            .filter(|(a, b)| {
+                p.iter()
+                    .filter(|(x, y)| (x == a && y == b) || (x == b && y == a))
+                    .count()
+                    > 1
+            })
+            .count();
         assert_eq!(dups, 0, "duplicate pair emitted: {p:?}");
         assert!(p.iter().any(|(a, b)| a == "estado" && b == "estado_fase0"));
     }
@@ -305,8 +331,16 @@ mod alignment {
     fn a_higher_threshold_never_proposes_more_pairs() {
         use lemmalog::canonical::jev_align::candidate_pairs;
         let names: Vec<String> = [
-            "estado", "estado_20260916", "estado_fase0", "paso_5", "paso_6", "branch",
-            "branch_intentada", "branch_mergitada", "wrangler", "deploy_worker",
+            "estado",
+            "estado_20260916",
+            "estado_fase0",
+            "paso_5",
+            "paso_6",
+            "branch",
+            "branch_intentada",
+            "branch_mergitada",
+            "wrangler",
+            "deploy_worker",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -317,7 +351,11 @@ mod alignment {
             assert!(n <= prev, "threshold {thr} proposed {n} > {prev}");
             prev = n;
         }
-        assert_eq!(candidate_pairs(&names, 1.01).len(), 0, "nothing clears an impossible bar");
+        assert_eq!(
+            candidate_pairs(&names, 1.01).len(),
+            0,
+            "nothing clears an impossible bar"
+        );
     }
 
     /// Found by the audit: a batch used to abort on the first transport
@@ -325,8 +363,6 @@ mod alignment {
     /// the engine. The edges survived; the caller got only an error.
     #[test]
     fn a_failure_mid_batch_keeps_the_report_of_what_was_asserted() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let n = std::sync::Arc::new(AtomicUsize::new(0));
         let body = r#"{"model":"jev-1.13.0","answers":{
              "align":{"type":"score","score":1.9,"confidence":0.94,
                       "legend":{"0":"a","1":"b","2":"c"},
@@ -335,9 +371,12 @@ mod alignment {
              "noise_only":{"type":"noul","noul":0.9}},
            "usage":{"input_tokens":1,"output_tokens":1}}"#;
         let mut c = JevClient::with_transport(
-            Box::new(move |_| {
-                // second pair blows up, the others succeed
-                if n.fetch_add(1, Ordering::SeqCst) == 1 {
+            Box::new(move |req: &str| {
+                // the boom pair blows up, the others succeed. Content-keyed,
+                // not call-order-keyed: reconcile now judges the batch
+                // bounded-concurrent, so transport observables per sequence
+                // position are scheduler-dependent.
+                if req.contains("boom") {
                     Err("http 503".into())
                 } else {
                     Ok(body.to_string())
@@ -346,16 +385,24 @@ mod alignment {
             "jev-latest",
         );
         let mut e = Engine::new();
-        let pairs: Vec<(String, String)> = [("estado_a", "estado"), ("boom_b", "boom"), ("modo_c", "modo")]
-            .iter()
-            .map(|(a, b)| (a.to_string(), b.to_string()))
-            .collect();
+        let pairs: Vec<(String, String)> = [
+            ("estado_a", "estado"),
+            ("boom_b", "boom"),
+            ("modo_c", "modo"),
+        ]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
         let (asserted, _curator, failed) =
             reconcile_with_jev(&mut e, &mut c, "d", &pairs, 0.30).unwrap();
         assert_eq!(asserted.len(), 2, "the batch ran to the end: {asserted:?}");
         assert_eq!(failed.len(), 1, "the failure is reported, not swallowed");
         assert_eq!(failed[0].0, "boom_b");
-        assert!(failed[0].2.contains("503"), "the reason survives: {}", failed[0].2);
+        assert!(
+            failed[0].2.contains("503"),
+            "the reason survives: {}",
+            failed[0].2
+        );
     }
 
     /// The trap this replaces cosine+prose for: two names one edit apart
@@ -368,8 +415,7 @@ mod alignment {
             "branch_intentada_luna_filtro_tipo_backfill".to_string(),
             "branch_mergitada_luna_filtro_tipo_backfill".to_string(),
         )];
-        let (asserted, curator, _) =
-            reconcile_with_jev(&mut e, &mut c, "d", &pairs, 0.30).unwrap();
+        let (asserted, curator, _) = reconcile_with_jev(&mut e, &mut c, "d", &pairs, 0.30).unwrap();
         assert!(
             asserted.is_empty(),
             "intentada and mergitada are opposite lifecycle states"

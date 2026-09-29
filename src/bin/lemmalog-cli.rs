@@ -87,7 +87,11 @@ fn main() {
             // transport fixed. `ts_or_wall_clock(None)` is the present, and
             // never backwards.
             let now = m.ts_or_wall_clock(None);
-            if now > m.engine.now {
+            // Like the MCP transport: an advance that cannot flip any
+            // valid-time bound leaves every derived view intact and skips
+            // the full recompute.
+            let old = m.engine.now;
+            if now > old && !m.engine.clock_advance_is_inert(old, now) {
                 m.engine.invalidate_derived();
             }
             let _ = m.maintain(now);
@@ -101,6 +105,12 @@ fn main() {
             );
             for d in dropped.iter().take(5) {
                 println!("dropped: {} ({})", d.0, d.1);
+            }
+            for line in lemmalog::agent::render_advisories(&report.advisories) {
+                println!("advisory: {line}");
+            }
+            if let Some(line) = lemmalog::agent::payload_advisory(report.payload) {
+                println!("{line}");
             }
         }
         "retract" => {

@@ -184,12 +184,18 @@ fn handle(state: &mut State, msg: &J) -> Option<J> {
 }
 
 fn transient_snapshot_path() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    // ponytail: nanosecond timestamps quantize finer than parallel test
+    // threads move; a call counter keeps every transient filename unique so
+    // two in-flight snapshots cannot unlink each other
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!(
-        "lemmalog-mcp-{}-{nonce}.snapshot",
+        "lemmalog-mcp-{}-{nonce}-{seq}.snapshot",
         std::process::id()
     ))
 }
@@ -418,7 +424,7 @@ fn tools() -> J {
         tool("lemmalog_canonicalize",
             "Entity resolution: asserts alias edges (line protocol 'local --alias_of[conf]--> canonical'), installs the canonicalization rules and canonical views over current. Conflicts surface as alias_conflict facts.", &["facts"], &["facts"]),
         tool("lemmalog_context",
-            "Query-driven context assembly via hybrid retrieval: BM25 over facts and episodes + entity-match boosting, budget-aware. Input: query (natural language) + optional budget_tokens (default 1000). Returns relevance-selected facts and their verbatim source episodes — use this instead of lemmalog_dump when preparing a grounded answer.", &["query", "budget_tokens"], &["query"]),
+            "Query-driven context assembly via hybrid retrieval: BM25 over facts and episodes + entity-match boosting, budget-aware. Input: query (natural language) + optional budget_tokens (default 1000). Returns relevance-selected facts and their verbatim source episodes, an ATTRIBUTION contrast (which subjects hold facts on the topic — a question-mentioned party with zero topic facts is a false-premise signal), and a CURRENT STATE section with the latest value per slot for current-state questions — use this instead of lemmalog_dump when preparing a grounded answer.", &["query", "budget_tokens"], &["query"]),
         tool("lemmalog_dump", "List facts of a predicate (or all) with confidence and provenance.", &["pred"], &[]),
         tool("lemmalog_changes",
             "Resync after a context reset or another agent's work: everything asserted, derived, or retracted since an epoch. Input: optional `since` epoch integer (default: 0 = everything, capped). The response carries the current epoch — checkpoint it and pass it back next time.", &["since"], &[]),
@@ -629,9 +635,12 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
             let (report, dropped) = mem.observe_extracted(facts, ts);
             // Facts keep `ts` as their valid-time (VF), but the derived view
             // is as of the present: backdating an episode must not rewind
-            // `current/3` past everything already asserted.
+            // `current/3` past everything already asserted. Like sync_clock,
+            // an advance that cannot flip any valid-time bound leaves every
+            // derived view intact and skips the full recompute it forces.
             let now = wall_clock().max(mem.engine.now);
-            if now > mem.engine.now {
+            let old = mem.engine.now;
+            if now > old && !mem.engine.clock_advance_is_inert(old, now) {
                 mem.engine.invalidate_derived();
             }
             mem.maintain(now);
@@ -662,6 +671,23 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
                 if dropped.len() > 5 {
                     out.push_str(&format!("\n  (+{} more)", dropped.len() - 5));
                 }
+            }
+            if !report.advisories.is_empty() {
+                // Deliberately NOT the word "dropped": `lemmalog_commit`
+                // sniffs it out of this very report to decide a rollback
+                // (see the commit arm below), and an advisory is not a
+                // refusal — the facts WERE asserted.
+                out.push_str(&format!(
+                    "\nadvisory {} line(s) — asserted, but the engine cannot reason over them:",
+                    report.advisories.len()
+                ));
+                for line in lemmalog::agent::render_advisories(&report.advisories) {
+                    out.push_str(&format!("\n  {line}"));
+                }
+            }
+            if let Some(line) = lemmalog::agent::payload_advisory(report.payload) {
+                out.push('\n');
+                out.push_str(&line);
             }
             Ok(out)
         }
@@ -936,7 +962,13 @@ let purged = state.memory.purge_declared_escalations();
                 Err("input: `query` is required — the natural-language question the context should serve".to_string())
             } else {
                 sync_clock(state);
-                Ok(state.memory.context_for_query(&query, budget))
+                // Rich, not plain: carries the attribution contrast ("NO
+                // topic facts for: X" when a mentioned entity holds nothing
+                // on the topic — the false-premise signal) and the
+                // latest-value-per-slot view for current-state questions.
+                // Plain `context_for_query` never told a caller "nothing
+                // here"; only the CLI had this until now.
+                Ok(state.memory.context_for_query_rich(&query, budget))
             }
         }
         "lemmalog_dump" => {
@@ -1277,6 +1309,43 @@ mod tests {
     }
 
     #[test]
+    fn context_tool_exposes_the_rich_attribution_contrast() {
+        // `lemmalog_context` used to call the plain retrieval path, which
+        // has no way to say "nothing here" — a question mentioning an
+        // entity the store knows nothing about got fluent, plausible-
+        // looking filler instead of an honest negative. The rich path adds
+        // an ATTRIBUTION section precisely for that. Regression: this must
+        // go through `tool_call`, the actual MCP dispatch path, not the
+        // library function directly — that is what silently regressed.
+        let mut state = State {
+            memory: AgentMemory::new(lemmalog::agent::MockExtractor::new(0.9), "").unwrap(),
+            path: None,
+        };
+        tool_call(
+            &mut state,
+            "lemmalog_observe",
+            &json!({"facts": "melanie --paints--> landscapes\ncaroline --received_necklace_from--> grandma"}),
+            None,
+        )
+        .unwrap();
+        // `melanie` IS a known subject (so `attribution` even runs), but she
+        // has no facts on the topic of THIS question — the false-premise
+        // shape the section exists to catch.
+        let result = tool_call(
+            &mut state,
+            "lemmalog_context",
+            &json!({"query": "what necklace did melanie receive?"}),
+            None,
+        )
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("ATTRIBUTION") && text.to_lowercase().contains("no topic facts"),
+            "the MCP context tool must expose the false-premise signal: {text}"
+        );
+    }
+
+    #[test]
     fn commit_rolls_back_when_observe_is_rejected() {
         let mut state = State {
             memory: AgentMemory::new(lemmalog::agent::MockExtractor::new(0.9), "").unwrap(),
@@ -1407,7 +1476,13 @@ mod tests {
         let mut restored = fresh_state();
         restore_snapshot(&mut restored, &bytes).unwrap();
         assert!(restored_gates.join(format!("{gate_id}.json")).exists());
-        let asked = tool_call(&mut restored, "gate_ask", &json!({"gate_id": gate_id}), None).unwrap();
+        let asked = tool_call(
+            &mut restored,
+            "gate_ask",
+            &json!({"gate_id": gate_id}),
+            None,
+        )
+        .unwrap();
         assert_eq!(asked["isError"].as_bool(), Some(false));
 
         clear_gate_env(&restored_gates);
@@ -1426,7 +1501,8 @@ mod tests {
         assert_eq!(engine, legacy.as_slice());
         assert!(gates.is_none());
 
-        let packed = pack_snapshot(b"engine", &json!({"sessions": {}, "calibration": null})).unwrap();
+        let packed =
+            pack_snapshot(b"engine", &json!({"sessions": {}, "calibration": null})).unwrap();
         let (engine, gates) = unpack_snapshot(&packed).unwrap();
         assert_eq!(engine, b"engine");
         assert!(gates.unwrap()["sessions"].is_object());

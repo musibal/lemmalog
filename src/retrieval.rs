@@ -100,9 +100,14 @@ fn tokenize(s: &str) -> Vec<String> {
     // Common function words: no topical signal, but they match everywhere
     // once relation names split on `_` (`works_at` -> `works`, `at`),
     // poisoning BM25 with false overlaps
-    const STOP: [&str; 22] = [
+    // English AND Spanish: this store's facts and questions are written in
+    // both, so an English-only list left `de`, `el`, `que`, `por` scoring
+    // as topical terms and matching everywhere.
+    const STOP: [&str; 44] = [
         "a", "an", "the", "at", "in", "on", "of", "to", "is", "are", "was", "were", "be", "do",
-        "does", "did", "who", "what", "which", "for", "with", "and",
+        "does", "did", "who", "what", "which", "for", "with", "and", "de", "del", "la", "el",
+        "los", "las", "un", "una", "y", "o", "en", "por", "para", "con", "que", "se", "su", "sus",
+        "es", "son", "al", "lo",
     ];
     s.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
@@ -189,6 +194,22 @@ fn internal_pred(p: &str) -> bool {
         || p == "describes"
         || p == "mentions"
         || p == "edge"
+        // Canonicalization VIEWS and the declaration tables that drive the
+        // update policy: plumbing, not knowledge. `current_canon` mirrors
+        // every `current` row, so leaving it indexed spent a measured ~23%
+        // of every retrieved context on duplicate copies of facts the
+        // caller already got — and on a generic query the copies displaced
+        // the originals out of the token budget entirely.
+        //
+        // This is keyed on HEAD names, so it cannot reach rows like
+        // `current(S, alias_of, O)`: those 326 rows stay indexed.
+        // every canonical/vocabulary view is generated as `{rel}_canon` /
+        // `{rel}_vocab`, so match the suffix instead of naming each one
+        || p.ends_with("_canon")
+        || p.ends_with("_vocab")
+        || p == "exclusive"
+        || p == "multi"
+        || p == "bad_alias"
         || p.starts_with("cnt_")
         || p.starts_with("__agg:")
         || p.starts_with("__magic")
@@ -337,14 +358,38 @@ impl Retrieval {
         }
     }
 
-    /// Entity names from the query: exact word match against known names
+    /// Entity names from the query: word-boundary match against known names
     /// (case-insensitive). This is the graph entry point.
+    ///
+    /// A single-token name must match a whole query token. Raw `contains`
+    /// let a 2-character name match inside any longer word — `es` inside
+    /// `eólicas`, `proto` inside `protocolo` — and each hit bought the full
+    /// +1.5 direct boost. Measured 2026-09-22: a question about a domain
+    /// with ZERO tokens in the store ("mantenimiento de turbinas eólicas
+    /// offshore") came back with 48 confidently-ranked lines and 0 relevant
+    /// ones. Retrieval must be able to answer "nothing here".
     fn query_entities(&self, query: &str) -> (BTreeSet<String>, BTreeSet<String>) {
         let q = query.to_lowercase();
+        let tokens: BTreeSet<&str> = q
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            .filter(|t| !t.is_empty())
+            .collect();
         let mut direct = BTreeSet::new();
         for name in self.by_entity.keys() {
             let ln = name.to_lowercase();
-            if ln.len() >= 2 && q.contains(&ln) {
+            // Compound names (`store_lemmalog`, `src/agent.rs:118`) are
+            // specific enough to match as a phrase; a bare word must not.
+            let compound = ln.contains(' ')
+                || ln.contains('_')
+                || ln.contains('/')
+                || ln.contains(':')
+                || ln.contains('-');
+            let hit = if compound {
+                q.contains(&ln)
+            } else {
+                tokens.contains(ln.as_str())
+            };
+            if hit {
                 direct.insert(name.clone());
             }
         }

@@ -18,3 +18,18 @@ lme-ctx/
 
 # per-snapshot embedding caches (benchmark iteration)
 *.snap.embed.json
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
+
+# caches e índices de harnesses de agente (estado de máquina, no fuente)
+.codegraph/
+.supercov/
+.codex/
+.cursor/
+.claude/
+WATCHDOG.yml

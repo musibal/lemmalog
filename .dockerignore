@@ -6,3 +6,11 @@
 .pi
 target
 *.snapshot
+.codegraph
+.supercov
+.codex
+.cursor
+.beads
+data
+lme-cache
+lme-ctx

@@ -97,6 +97,33 @@ fn verbose_logs() -> bool {
     )
 }
 
+/// El log de eventos persistente. `docker logs` vive y muere con el
+/// contenedor, asi que un evento que solo va a stderr no sobrevive a un
+/// recreate: si LEMMALOG_MCP_EVENTS apunta a un fichero (en el volumen del
+/// host), cada llamada deja ademas una linea JSON ahi.
+fn append_event(event: &J) {
+    use std::io::Write;
+    let Ok(path) = std::env::var("LEMMALOG_MCP_EVENTS") else {
+        return;
+    };
+    // Abrir por evento en lugar de cachear el descriptor: una llamada del
+    // modelo cuesta cientos de ms, el open cuesta microsegundos, y asi el
+    // destino se puede cambiar (o comprobar) sin reiniciar el proceso.
+    // Un fallo del log NUNCA debe tumbar la llamada.
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            if let Err(e) = writeln!(file, "{event}") {
+                eprintln!("lemmajevgaun: no puedo escribir el evento: {e}");
+            }
+        }
+        Err(e) => eprintln!("lemmajevgaun: no puedo abrir LEMMALOG_MCP_EVENTS={path}: {e}"),
+    }
+}
+
 fn handle(state: &mut State, msg: &J) -> Option<J> {
     let id = msg.get("id").cloned();
     let notification = id.is_none();
@@ -140,7 +167,8 @@ fn handle(state: &mut State, msg: &J) -> Option<J> {
             }),
         })
     };
-    if verbose_logs() {
+    let elapsed_ms = started.elapsed().as_millis();
+    let (question, answer) = if verbose_logs() {
         let input = &msg["params"]["arguments"];
         let output = response
             .as_ref()
@@ -157,29 +185,33 @@ fn handle(state: &mut State, msg: &J) -> Option<J> {
             "lemmalog_why" => input.get("fact"),
             _ => None,
         };
-        if let Some(question) = question {
-            eprintln!(
-                "lemmajevgaun: op={operation} id={} outcome={outcome} elapsed_ms={} question={} answer={}",
-                msg["id"],
-                started.elapsed().as_millis(),
-                question,
-                output,
-            );
-        } else {
-            eprintln!(
-                "lemmajevgaun: op={operation} id={} outcome={outcome} elapsed_ms={} input={} output={}",
-                msg["id"],
-                started.elapsed().as_millis(),
-                input,
-                output,
-            );
-        }
+        (question.cloned().unwrap_or_else(|| input.clone()), output)
     } else {
+        (J::Null, J::Null)
+    };
+    let event = json!({
+        "ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "op": operation,
+        "id": msg["id"],
+        "outcome": outcome,
+        "elapsed_ms": elapsed_ms,
+        "question": question,
+        "answer": answer,
+    });
+    // Un solo dueño del evento: el log de stderr (lo que ve `docker logs`) y el
+    // registro persistente salen del mismo valor, nunca de dos formateos.
+    if verbose_logs() {
         eprintln!(
-            "lemmajevgaun: op={operation} outcome={outcome} elapsed_ms={}",
-            started.elapsed().as_millis()
+            "lemmajevgaun: op={operation} id={} outcome={outcome} elapsed_ms={elapsed_ms} question={} answer={}",
+            msg["id"], event["question"], event["answer"],
         );
+    } else {
+        eprintln!("lemmajevgaun: op={operation} outcome={outcome} elapsed_ms={elapsed_ms}");
     }
+    append_event(&event);
     response
 }
 
@@ -1235,6 +1267,43 @@ mod tests {
             tools().as_array().unwrap().len(),
             wire.len()
         );
+    }
+
+    /// El log de eventos tiene que sobrevivir al contenedor: `docker logs`
+    /// se pierde en cada recreate. Una llamada real debe dejar su linea JSON
+    /// en el fichero del volumen, y una escritura imposible no debe tumbar
+    /// la llamada del modelo.
+    #[test]
+    fn every_call_leaves_a_json_line_in_the_event_log() {
+        let dir = std::env::temp_dir().join(format!("lemmalog-eventos-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("eventos.jsonl");
+        std::fs::remove_file(&log).ok();
+        // SAFETY: el test es de un solo hilo sobre su propio fichero.
+        unsafe { std::env::set_var("LEMMALOG_MCP_EVENTS", &log) };
+
+        append_event(&json!({"op": "lemmalog_context", "outcome": "ok", "elapsed_ms": 3}));
+        append_event(&json!({"op": "lemmalog_observe", "outcome": "tool_error", "elapsed_ms": 9}));
+
+        let lines: Vec<J> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("cada linea es JSON completo"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "una linea por llamada, en orden y sin pisarse"
+        );
+        assert_eq!(lines[0]["op"], "lemmalog_context");
+        assert_eq!(lines[1]["outcome"], "tool_error");
+
+        // Destino imposible: avisa, pero no propaga el fallo al llamante.
+        unsafe { std::env::set_var("LEMMALOG_MCP_EVENTS", dir.join("no/existe/eventos.jsonl")) };
+        append_event(&json!({"op": "lemmalog_context"}));
+
+        unsafe { std::env::remove_var("LEMMALOG_MCP_EVENTS") };
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

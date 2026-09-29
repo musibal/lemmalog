@@ -33,7 +33,8 @@ ENV HOME=/data \
     LEMMALOG_MCP_PATH=/data/lemmalog.snapshot \
     LEMMALOG_GATE_DIR=/data/gates \
     LEMMALOG_GATE_CALIBRATION=/data/gate-calibration.jsonl \
-    LEMMALOG_MCP_LOG_BODIES=1
+    LEMMALOG_MCP_LOG_BODIES=1 \
+    LEMMALOG_MCP_EVENTS=/data/eventos.jsonl
 VOLUME ["/data"]
 EXPOSE 8765
 ENTRYPOINT ["/usr/local/bin/lemmajevgaun-mcp"]
